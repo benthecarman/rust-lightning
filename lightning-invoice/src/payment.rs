@@ -115,11 +115,11 @@
 //! # let router = FakeRouter {};
 //! # let scorer = RefCell::new(FakeScorer {});
 //! # let logger = FakeLogger {};
-//! let invoice_payer = InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(2));
+//! let invoice_payer = InvoicePayer::new(&payer, router, &logger, event_handler);
 //!
 //! let invoice = "...";
 //! if let Ok(invoice) = invoice.parse::<Invoice>() {
-//!     invoice_payer.pay_invoice(&invoice).unwrap();
+//!     invoice_payer.pay_invoice(&invoice, Retry::Attempts(2)).unwrap();
 //!
 //! # let event_provider = FakeEventProvider {};
 //!     loop {
@@ -157,6 +157,7 @@ use core::fmt::{Debug, Display, Formatter};
 use core::future::Future;
 use core::ops::Deref;
 use core::time::Duration;
+use std::fs::read;
 #[cfg(feature = "std")]
 use std::time::SystemTime;
 
@@ -197,8 +198,7 @@ pub struct InvoicePayerUsingTime<
 	logger: L,
 	event_handler: E,
 	/// Caches the overall attempts at making a payment, which is updated prior to retrying.
-	payment_cache: Mutex<HashMap<PaymentHash, PaymentAttempts<T>>>,
-	retry: Retry,
+	payment_cache: Mutex<HashMap<PaymentHash, PaymentAttempts<T>>>
 }
 
 /// Storing minimal payment attempts information required for determining if a outbound payment can
@@ -327,7 +327,7 @@ where
 	/// Will forward any [`Event::PaymentPathFailed`] events to the decorated `event_handler` once
 	/// `retry` has been exceeded for a given [`Invoice`].
 	pub fn new(
-		payer: P, router: R, logger: L, event_handler: E, retry: Retry
+		payer: P, router: R, logger: L, event_handler: E
 	) -> Self {
 		Self {
 			payer,
@@ -335,7 +335,6 @@ where
 			logger,
 			event_handler,
 			payment_cache: Mutex::new(HashMap::new()),
-			retry,
 		}
 	}
 
@@ -347,9 +346,9 @@ where
 	///
 	/// If you wish to use a different payment idempotency token, see
 	/// [`Self::pay_invoice_with_id`].
-	pub fn pay_invoice(&self, invoice: &Invoice) -> Result<PaymentId, PaymentError> {
+	pub fn pay_invoice(&self, invoice: &Invoice, retry: Retry) -> Result<PaymentId, PaymentError> {
 		let payment_id = PaymentId(invoice.payment_hash().into_inner());
-		self.pay_invoice_with_id(invoice, payment_id).map(|()| payment_id)
+		self.pay_invoice_with_id(invoice, payment_id, retry).map(|()| payment_id)
 	}
 
 	/// Pays the given [`Invoice`] with a custom idempotency key, caching the invoice for later use
@@ -363,11 +362,11 @@ where
 	///
 	/// See [`Self::pay_invoice`] for a variant which uses the [`PaymentHash`] for the idempotency
 	/// token.
-	pub fn pay_invoice_with_id(&self, invoice: &Invoice, payment_id: PaymentId) -> Result<(), PaymentError> {
+	pub fn pay_invoice_with_id(&self, invoice: &Invoice, payment_id: PaymentId, retry: Retry) -> Result<(), PaymentError> {
 		if invoice.amount_milli_satoshis().is_none() {
 			Err(PaymentError::Invoice("amount missing"))
 		} else {
-			self.pay_invoice_using_amount(invoice, None, payment_id)
+			self.pay_invoice_using_amount(invoice, None, payment_id, retry)
 		}
 	}
 
@@ -381,10 +380,10 @@ where
 	/// If you wish to use a different payment idempotency token, see
 	/// [`Self::pay_zero_value_invoice_with_id`].
 	pub fn pay_zero_value_invoice(
-		&self, invoice: &Invoice, amount_msats: u64
+		&self, invoice: &Invoice, amount_msats: u64, retry: Retry
 	) -> Result<PaymentId, PaymentError> {
 		let payment_id = PaymentId(invoice.payment_hash().into_inner());
-		self.pay_zero_value_invoice_with_id(invoice, amount_msats, payment_id).map(|()| payment_id)
+		self.pay_zero_value_invoice_with_id(invoice, amount_msats, payment_id, retry).map(|()| payment_id)
 	}
 
 	/// Pays the given zero-value [`Invoice`] using the given amount and custom idempotency key,
@@ -399,17 +398,17 @@ where
 	/// See [`Self::pay_zero_value_invoice`] for a variant which uses the [`PaymentHash`] for the
 	/// idempotency token.
 	pub fn pay_zero_value_invoice_with_id(
-		&self, invoice: &Invoice, amount_msats: u64, payment_id: PaymentId
+		&self, invoice: &Invoice, amount_msats: u64, payment_id: PaymentId, retry: Retry
 	) -> Result<(), PaymentError> {
 		if invoice.amount_milli_satoshis().is_some() {
 			Err(PaymentError::Invoice("amount unexpected"))
 		} else {
-			self.pay_invoice_using_amount(invoice, Some(amount_msats), payment_id)
+			self.pay_invoice_using_amount(invoice, Some(amount_msats), payment_id, retry)
 		}
 	}
 
 	fn pay_invoice_using_amount(
-		&self, invoice: &Invoice, amount_msats: Option<u64>, payment_id: PaymentId
+		&self, invoice: &Invoice, amount_msats: Option<u64>, payment_id: PaymentId, retry: Retry
 	) -> Result<(), PaymentError> {
 		debug_assert!(invoice.amount_milli_satoshis().is_some() ^ amount_msats.is_some());
 
@@ -436,7 +435,7 @@ where
 			self.payer.send_payment(route, payment_hash, &payment_secret, payment_id)
 		};
 
-		self.pay_internal(&route_params, payment_hash, send_payment)
+		self.pay_internal(&route_params, payment_hash, send_payment, retry)
 			.map_err(|e| { self.payment_cache.lock().unwrap().remove(&payment_hash); e })
 	}
 
@@ -448,12 +447,12 @@ where
 	/// ensure that a second payment with the same [`PaymentPreimage`] is never sent.
 	pub fn pay_pubkey(
 		&self, pubkey: PublicKey, payment_preimage: PaymentPreimage, amount_msats: u64,
-		final_cltv_expiry_delta: u32
+		final_cltv_expiry_delta: u32, retry: Retry
 	) -> Result<PaymentId, PaymentError> {
 		let payment_hash = PaymentHash(Sha256::hash(&payment_preimage.0).into_inner());
 		let payment_id = PaymentId(payment_hash.0);
 		self.do_pay_pubkey(pubkey, payment_preimage, payment_hash, payment_id, amount_msats,
-				final_cltv_expiry_delta)
+				final_cltv_expiry_delta, retry)
 			.map(|()| payment_id)
 	}
 
@@ -467,16 +466,16 @@ where
 	/// [`PaymentHash`] has never been paid before.
 	pub fn pay_pubkey_with_id(
 		&self, pubkey: PublicKey, payment_preimage: PaymentPreimage, payment_id: PaymentId,
-		amount_msats: u64, final_cltv_expiry_delta: u32
+		amount_msats: u64, final_cltv_expiry_delta: u32, retry: Retry
 	) -> Result<(), PaymentError> {
 		let payment_hash = PaymentHash(Sha256::hash(&payment_preimage.0).into_inner());
 		self.do_pay_pubkey(pubkey, payment_preimage, payment_hash, payment_id, amount_msats,
-				final_cltv_expiry_delta)
+				final_cltv_expiry_delta, retry)
 	}
 
 	fn do_pay_pubkey(
 		&self, pubkey: PublicKey, payment_preimage: PaymentPreimage, payment_hash: PaymentHash,
-		payment_id: PaymentId, amount_msats: u64, final_cltv_expiry_delta: u32
+		payment_id: PaymentId, amount_msats: u64, final_cltv_expiry_delta: u32, retry: Retry
 	) -> Result<(), PaymentError> {
 		match self.payment_cache.lock().unwrap().entry(payment_hash) {
 			hash_map::Entry::Occupied(_) => return Err(PaymentError::Invoice("payment pending")),
@@ -492,12 +491,12 @@ where
 		let send_payment = |route: &Route| {
 			self.payer.send_spontaneous_payment(route, payment_preimage, payment_id)
 		};
-		self.pay_internal(&route_params, payment_hash, send_payment)
+		self.pay_internal(&route_params, payment_hash, send_payment, retry)
 			.map_err(|e| { self.payment_cache.lock().unwrap().remove(&payment_hash); e })
 	}
 
 	fn pay_internal<F: FnOnce(&Route) -> Result<(), PaymentSendFailure> + Copy>(
-		&self, params: &RouteParameters, payment_hash: PaymentHash, send_payment: F,
+		&self, params: &RouteParameters, payment_hash: PaymentHash, send_payment: F, retry: Retry,
 	) -> Result<(), PaymentError> {
 		#[cfg(feature = "std")] {
 			if has_expired(params) {
@@ -523,9 +522,9 @@ where
 					let mut payment_cache = self.payment_cache.lock().unwrap();
 					let payment_attempts = payment_cache.get_mut(&payment_hash).unwrap();
 					payment_attempts.count += 1;
-					if self.retry.is_retryable_now(payment_attempts) {
+					if retry.is_retryable_now(payment_attempts) {
 						core::mem::drop(payment_cache);
-						Ok(self.pay_internal(params, payment_hash, send_payment)?)
+						Ok(self.pay_internal(params, payment_hash, send_payment, retry)?)
 					} else {
 						Err(e)
 					}
@@ -536,7 +535,7 @@ where
 						// recipient may misbehave and claim the funds, at which point we have to
 						// consider the payment sent, so return `Ok()` here, ignoring any retry
 						// errors.
-						let _ = self.retry_payment(payment_id, payment_hash, &retry_data);
+						let _ = self.retry_payment(payment_id, payment_hash, &retry_data, retry);
 						Ok(())
 					} else {
 						// This may happen if we send a payment and some paths fail, but
@@ -551,7 +550,7 @@ where
 	}
 
 	fn retry_payment(
-		&self, payment_id: PaymentId, payment_hash: PaymentHash, params: &RouteParameters
+		&self, payment_id: PaymentId, payment_hash: PaymentHash, params: &RouteParameters, retry: Retry
 	) -> Result<(), ()> {
 		let attempts =
 			*self.payment_cache.lock().unwrap().entry(payment_hash)
@@ -561,7 +560,7 @@ where
 					first_attempted_at: T::now()
 				});
 
-		if !self.retry.is_retryable_now(&attempts) {
+		if !retry.is_retryable_now(&attempts) {
 			log_trace!(self.logger, "Payment {} exceeded maximum attempts; not retrying ({})", log_bytes!(payment_hash.0), attempts);
 			return Err(());
 		}
@@ -594,16 +593,16 @@ where
 				Err(())
 			},
 			Err(PaymentSendFailure::AllFailedResendSafe(_)) => {
-				self.retry_payment(payment_id, payment_hash, params)
+				self.retry_payment(payment_id, payment_hash, params, retry)
 			},
 			Err(PaymentSendFailure::DuplicatePayment) => {
 				log_error!(self.logger, "Got a DuplicatePayment error when attempting to retry a payment, this shouldn't happen.");
 				Err(())
 			}
 			Err(PaymentSendFailure::PartialFailure { failed_paths_retry, .. }) => {
-				if let Some(retry) = failed_paths_retry {
+				if let Some(retry_params) = failed_paths_retry {
 					// Always return Ok for the same reason as noted in pay_internal.
-					let _ = self.retry_payment(payment_id, payment_hash, &retry);
+					let _ = self.retry_payment(payment_id, payment_hash, &retry_params, retry);
 				}
 				Ok(())
 			},
@@ -641,7 +640,7 @@ where
 	fn handle_event_internal(&self, event: &Event) -> bool {
 		match event {
 			Event::PaymentPathFailed {
-				payment_id, payment_hash, payment_failed_permanently, path, short_channel_id, retry, ..
+				payment_id, payment_hash, payment_failed_permanently, path, short_channel_id, retry_params, ..
 			} => {
 				if let Some(short_channel_id) = short_channel_id {
 					let path = path.iter().collect::<Vec<_>>();
@@ -653,10 +652,10 @@ where
 				} else if *payment_failed_permanently {
 					log_trace!(self.logger, "Payment {} rejected by destination; not retrying", log_bytes!(payment_hash.0));
 					self.payer.abandon_payment(payment_id.unwrap());
-				} else if retry.is_none() {
+				} else if retry_params.is_none() {
 					log_trace!(self.logger, "Payment {} missing retry params; not retrying", log_bytes!(payment_hash.0));
 					self.payer.abandon_payment(payment_id.unwrap());
-				} else if self.retry_payment(payment_id.unwrap(), *payment_hash, retry.as_ref().unwrap()).is_ok() {
+				} else if self.retry_payment(payment_id.unwrap(), *payment_hash, retry_params.as_ref().unwrap()).is_ok() {
 					// We retried at least somewhat, don't provide the PaymentPathFailed event to the user.
 					return false;
 				} else {
@@ -860,9 +859,9 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(2));
+			InvoicePayer::new(&payer, router, &logger, event_handler);
 
-		let payment_id = Some(invoice_payer.pay_invoice(&invoice).unwrap());
+		let payment_id = Some(invoice_payer.pay_invoice(&invoice, Retry::Attempts(2)).unwrap());
 		assert_eq!(*payer.attempts.borrow(), 1);
 
 		let event = Event::PaymentPathFailed {
@@ -904,9 +903,9 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(2));
+			InvoicePayer::new(&payer, router, &logger, event_handler);
 
-		assert!(invoice_payer.pay_invoice(&invoice).is_ok());
+		assert!(invoice_payer.pay_invoice(&invoice, Retry::Attempts(2)).is_ok());
 	}
 
 	#[test]
@@ -925,7 +924,7 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(2));
+			InvoicePayer::new(&payer, router, &logger, event_handler);
 
 		let payment_id = Some(PaymentId([1; 32]));
 		let event = Event::PaymentPathFailed {
@@ -969,9 +968,9 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(2));
+			InvoicePayer::new(&payer, router, &logger, event_handler);
 
-		let payment_id = Some(invoice_payer.pay_invoice(&invoice).unwrap());
+		let payment_id = Some(invoice_payer.pay_invoice(&invoice, Retry::Attempts(2)).unwrap());
 		assert_eq!(*payer.attempts.borrow(), 1);
 
 		let event = Event::PaymentPathFailed {
@@ -1028,9 +1027,9 @@ mod tests {
 		type InvoicePayerUsingSinceEpoch <P, R, L, E> = InvoicePayerUsingTime::<P, R, L, E, SinceEpoch>;
 
 		let invoice_payer =
-			InvoicePayerUsingSinceEpoch::new(&payer, router, &logger, event_handler, Retry::Timeout(Duration::from_secs(120)));
+			InvoicePayerUsingSinceEpoch::new(&payer, router, &logger, event_handler);
 
-		let payment_id = Some(invoice_payer.pay_invoice(&invoice).unwrap());
+		let payment_id = Some(invoice_payer.pay_invoice(&invoice,Retry::Timeout(Duration::from_secs(120))).unwrap());
 		assert_eq!(*payer.attempts.borrow(), 1);
 
 		let event = Event::PaymentPathFailed {
@@ -1067,9 +1066,9 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(2));
+			InvoicePayer::new(&payer, router, &logger, event_handle);
 
-		let payment_id = Some(invoice_payer.pay_invoice(&invoice).unwrap());
+		let payment_id = Some(invoice_payer.pay_invoice(&invoice, Retry::Attempts(2)).unwrap());
 		assert_eq!(*payer.attempts.borrow(), 1);
 
 		let event = Event::PaymentPathFailed {
@@ -1098,11 +1097,11 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(2));
+			InvoicePayer::new(&payer, router, &logger, event_handler);
 
 		let payment_preimage = PaymentPreimage([1; 32]);
 		let invoice = expired_invoice(payment_preimage);
-		if let PaymentError::Invoice(msg) = invoice_payer.pay_invoice(&invoice).unwrap_err() {
+		if let PaymentError::Invoice(msg) = invoice_payer.pay_invoice(&invoice, Retry::Attempts(2)).unwrap_err() {
 			assert_eq!(msg, "Invoice expired prior to send");
 		} else { panic!("Expected Invoice Error"); }
 	}
@@ -1122,9 +1121,9 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router,  &logger, event_handler, Retry::Attempts(2));
+			InvoicePayer::new(&payer, router,  &logger, event_handler);
 
-		let payment_id = Some(invoice_payer.pay_invoice(&invoice).unwrap());
+		let payment_id = Some(invoice_payer.pay_invoice(&invoice, Retry::Attempts(2)).unwrap());
 		assert_eq!(*payer.attempts.borrow(), 1);
 
 		let mut retry_data = TestRouter::retry_for_invoice(&invoice);
@@ -1162,9 +1161,9 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(2));
+			InvoicePayer::new(&payer, router, &logger, event_handler);
 
-		let payment_id = Some(invoice_payer.pay_invoice(&invoice).unwrap());
+		let payment_id = Some(invoice_payer.pay_invoice(&invoice, Retry::Attempts(2)).unwrap());
 		assert_eq!(*payer.attempts.borrow(), 1);
 
 		let event = Event::PaymentPathFailed {
@@ -1195,9 +1194,9 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(2));
+			InvoicePayer::new(&payer, router, &logger, event_handler);
 
-		let payment_id = Some(invoice_payer.pay_invoice(&invoice).unwrap());
+		let payment_id = Some(invoice_payer.pay_invoice(&invoice, Retry::Attempts(2)).unwrap());
 		assert_eq!(*payer.attempts.borrow(), 1);
 
 		let event = Event::PaymentPathFailed {
@@ -1230,9 +1229,9 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(0));
+			InvoicePayer::new(&payer, router, &logger, event_handler);
 
-		let payment_id = Some(invoice_payer.pay_invoice(&invoice).unwrap());
+		let payment_id = Some(invoice_payer.pay_invoice(&invoice, Retry::Attempts(0)).unwrap());
 
 		// Cannot repay an invoice pending payment.
 		match invoice_payer.pay_invoice(&invoice) {
@@ -1268,11 +1267,11 @@ mod tests {
 		let router = FailingRouter {};
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, |_: Event| {}, Retry::Attempts(0));
+			InvoicePayer::new(&payer, router, &logger, |_: Event| {});
 
 		let payment_preimage = PaymentPreimage([1; 32]);
 		let invoice = invoice(payment_preimage);
-		match invoice_payer.pay_invoice(&invoice) {
+		match invoice_payer.pay_invoice(&invoice, Retry::Attempts(0)) {
 			Err(PaymentError::Routing(_)) => {},
 			Err(_) => panic!("unexpected error"),
 			Ok(_) => panic!("expected routing error"),
@@ -1291,9 +1290,9 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, |_: Event| {}, Retry::Attempts(0));
+			InvoicePayer::new(&payer, router, &logger, |_: Event| {});
 
-		match invoice_payer.pay_invoice(&invoice) {
+		match invoice_payer.pay_invoice(&invoice, Retry::Attempts(0)) {
 			Err(PaymentError::Sending(_)) => {},
 			Err(_) => panic!("unexpected error"),
 			Ok(_) => panic!("expected sending error"),
@@ -1314,10 +1313,10 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(0));
+			InvoicePayer::new(&payer, router, &logger, event_handler);
 
 		let payment_id =
-			Some(invoice_payer.pay_zero_value_invoice(&invoice, final_value_msat).unwrap());
+			Some(invoice_payer.pay_zero_value_invoice(&invoice, final_value_msat, Retry::Attempts(0)).unwrap());
 		assert_eq!(*payer.attempts.borrow(), 1);
 
 		invoice_payer.handle_event(Event::PaymentSent {
@@ -1336,13 +1335,13 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router,  &logger, event_handler, Retry::Attempts(0));
+			InvoicePayer::new(&payer, router,  &logger, event_handler);
 
 		let payment_preimage = PaymentPreimage([1; 32]);
 		let invoice = invoice(payment_preimage);
 
 		// Cannot repay an invoice pending payment.
-		match invoice_payer.pay_zero_value_invoice(&invoice, 100) {
+		match invoice_payer.pay_zero_value_invoice(&invoice, 100, Retry::Attempts(0)) {
 			Err(PaymentError::Invoice("amount unexpected")) => {},
 			Err(_) => panic!("unexpected error"),
 			Ok(_) => panic!("expected invoice error"),
@@ -1366,10 +1365,10 @@ mod tests {
 		let router = TestRouter::new(TestScorer::new());
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(2));
+			InvoicePayer::new(&payer, router, &logger, event_handler);
 
 		let payment_id = Some(invoice_payer.pay_pubkey(
-				pubkey, payment_preimage, final_value_msat, final_cltv_expiry_delta
+				pubkey, payment_preimage, final_value_msat, final_cltv_expiry_delta, Retry::Attempts(2)
 			).unwrap());
 		assert_eq!(*payer.attempts.borrow(), 1);
 
@@ -1421,9 +1420,9 @@ mod tests {
 		let router = TestRouter::new(scorer);
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(2));
+			InvoicePayer::new(&payer, router, &logger, event_handler);
 
-		let payment_id = Some(invoice_payer.pay_invoice(&invoice).unwrap());
+		let payment_id = Some(invoice_payer.pay_invoice(&invoice, Retry::Attempts(2)).unwrap());
 		let event = Event::PaymentPathFailed {
 			payment_id,
 			payment_hash,
@@ -1456,9 +1455,9 @@ mod tests {
 		let router = TestRouter::new(scorer);
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(2));
+			InvoicePayer::new(&payer, router, &logger, event_handler);
 
-		let payment_id = invoice_payer.pay_invoice(&invoice).unwrap();
+		let payment_id = invoice_payer.pay_invoice(&invoice, Retry::Attempts(2)).unwrap();
 		let event = Event::PaymentPathSuccessful {
 			payment_id, payment_hash, path: route.paths[0].clone()
 		};
@@ -1499,17 +1498,17 @@ mod tests {
 		let router = TestRouter::new(scorer);
 		let logger = TestLogger::new();
 		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(0));
+			InvoicePayer::new(&payer, router, &logger, event_handler);
 
 		// Make first invoice payment.
-		invoice_payer.pay_invoice(&payment_invoice).unwrap();
+		invoice_payer.pay_invoice(&payment_invoice, Retry::Attempts(0)).unwrap();
 
 		// Let's pay a second invoice that will be using the same path. This should trigger the
 		// assertions that expect `ChannelUsage` values of the first invoice payment that is still
 		// in-flight.
 		let payment_preimage_2 = PaymentPreimage([2; 32]);
 		let payment_invoice_2 = invoice(payment_preimage_2);
-		invoice_payer.pay_invoice(&payment_invoice_2).unwrap();
+		invoice_payer.pay_invoice(&payment_invoice_2, Retry::Attempts(0)).unwrap();
 	}
 
 	#[test]
@@ -1552,11 +1551,10 @@ mod tests {
 			.expect_usage(ChannelUsage { amount_msat: 26, inflight_htlc_msat: 74 + 32 + 10, effective_capacity: EffectiveCapacity::Unknown } );
 		let router = TestRouter::new(scorer);
 		let logger = TestLogger::new();
-		let invoice_payer =
-			InvoicePayer::new(&payer, router, &logger, event_handler, Retry::Attempts(2));
+		let invoice_payer = InvoicePayer::new(&payer, router, &logger, event_handler);
 
 		// Fail 1st path, leave 2nd path inflight
-		let payment_id = Some(invoice_payer.pay_invoice(&payment_invoice).unwrap());
+		let payment_id = Some(invoice_payer.pay_invoice(&payment_invoice, Retry::Attempts(2)).unwrap());
 		invoice_payer.payer.fail_path(&TestRouter::path_for_value(final_value_msat));
 		invoice_payer.handle_event(Event::PaymentPathFailed {
 			payment_id,
@@ -2078,11 +2076,11 @@ mod tests {
 		router.expect_find_route(Ok(route.clone()));
 
 		let event_handler = |_: Event| { panic!(); };
-		let invoice_payer = InvoicePayer::new(nodes[0].node, router, nodes[0].logger, event_handler, Retry::Attempts(1));
+		let invoice_payer = InvoicePayer::new(nodes[0].node, router, nodes[0].logger, event_handler);
 
 		assert!(invoice_payer.pay_invoice(&create_invoice_from_channelmanager_and_duration_since_epoch(
 			&nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::Bitcoin,
-			Some(100_010_000), "Invoice".to_string(), duration_since_epoch(), 3600).unwrap())
+			Some(100_010_000), "Invoice".to_string(), duration_since_epoch(), 3600).unwrap(), Retry::Attempts(1))
 			.is_ok());
 		let htlc_msgs = nodes[0].node.get_and_clear_pending_msg_events();
 		assert_eq!(htlc_msgs.len(), 2);
@@ -2123,11 +2121,11 @@ mod tests {
 		router.expect_find_route(Ok(route.clone()));
 
 		let event_handler = |_: Event| { panic!(); };
-		let invoice_payer = InvoicePayer::new(nodes[0].node, router, nodes[0].logger, event_handler, Retry::Attempts(1));
+		let invoice_payer = InvoicePayer::new(nodes[0].node, router, nodes[0].logger, event_handler);
 
 		assert!(invoice_payer.pay_invoice(&create_invoice_from_channelmanager_and_duration_since_epoch(
 			&nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::Bitcoin,
-			Some(100_010_000), "Invoice".to_string(), duration_since_epoch(), 3600).unwrap())
+			Some(100_010_000), "Invoice".to_string(), duration_since_epoch(), 3600).unwrap(), Retry::Attempts(1))
 			.is_ok());
 		let htlc_msgs = nodes[0].node.get_and_clear_pending_msg_events();
 		assert_eq!(htlc_msgs.len(), 2);
@@ -2204,11 +2202,11 @@ mod tests {
 			let event_checker = expected_events.borrow_mut().pop_front().unwrap();
 			event_checker(event);
 		};
-		let invoice_payer = InvoicePayer::new(nodes[0].node, router, nodes[0].logger, event_handler, Retry::Attempts(1));
+		let invoice_payer = InvoicePayer::new(nodes[0].node, router, nodes[0].logger, event_handler);
 
 		assert!(invoice_payer.pay_invoice(&create_invoice_from_channelmanager_and_duration_since_epoch(
 			&nodes[1].node, nodes[1].keys_manager, nodes[1].logger, Currency::Bitcoin,
-			Some(100_010_000), "Invoice".to_string(), duration_since_epoch(), 3600).unwrap())
+			Some(100_010_000), "Invoice".to_string(), duration_since_epoch(), 3600).unwrap(), Retry::Attempts(1))
 			.is_ok());
 		let htlc_updates = SendEvent::from_node(&nodes[0]);
 		check_added_monitors!(nodes[0], 1);
