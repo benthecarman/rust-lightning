@@ -427,7 +427,7 @@ pub struct Sha256(/// (C-not exported) as the native hash types are not currentl
 /// # Invariants
 /// The description can be at most 639 __bytes__ long
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
-pub struct Description(String);
+pub struct Description(pub String);
 
 /// Payee public key
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
