@@ -20,7 +20,7 @@ esplora-blocking = ["esplora-client/blocking"]
 async-interface = []
 
 [dependencies]
-lightning = { version = "0.0.113", path = "../lightning" }
+lightning = { version = "0.0.113", path = "../lightning", default-features = false  }
 bitcoin = "0.29.0"
 bdk-macros = "0.6"
 futures = { version = "0.3", optional = true }
