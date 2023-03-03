@@ -257,7 +257,7 @@ impl Retry {
 	}
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub(super) fn has_expired(route_params: &RouteParameters) -> bool {
 	if let Some(expiry_time) = route_params.payment_params.expiry_time {
 		if let Ok(elapsed) = std::time::SystemTime::UNIX_EPOCH.elapsed() {
@@ -584,7 +584,7 @@ impl OutboundPayments {
 		SP: Fn(&Vec<RouteHop>, &Option<PaymentParameters>, &PaymentHash, &Option<PaymentSecret>, u64,
 		    u32, PaymentId, &Option<PaymentPreimage>, [u8; 32]) -> Result<(), APIError>
 	{
-		#[cfg(feature = "std")] {
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))] {
 			if has_expired(&route_params) {
 				return Err(RetryableSendFailure::PaymentExpired)
 			}
@@ -624,7 +624,7 @@ impl OutboundPayments {
 		SP: Fn(&Vec<RouteHop>, &Option<PaymentParameters>, &PaymentHash, &Option<PaymentSecret>, u64,
 		    u32, PaymentId, &Option<PaymentPreimage>, [u8; 32]) -> Result<(), APIError>
 	{
-		#[cfg(feature = "std")] {
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))] {
 			if has_expired(&route_params) {
 				log_error!(logger, "Payment params expired on retry, abandoning payment {}", log_bytes!(payment_id.0));
 				self.abandon_payment(payment_id, pending_events);
