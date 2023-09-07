@@ -1481,12 +1481,12 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Deref> ScoreUpdate for Probabilistic
 impl<G: Deref<Target = NetworkGraph<L>>, L: Deref> Score for ProbabilisticScorer<G, L>
 where L::Target: Logger {}
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 #[inline]
 fn powf64(n: f64, exp: f64) -> f64 {
 	n.powf(exp)
 }
-#[cfg(not(feature = "std"))]
+#[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
 fn powf64(n: f64, exp: f64) -> f64 {
 	libm::powf(n as f32, exp as f32) as f64
 }

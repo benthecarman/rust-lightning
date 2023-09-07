@@ -58,6 +58,9 @@ version = "0.30.2"
 default-features = false
 features = ["bitcoinconsensus", "secp-recovery"]
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+libm = { version = "0.2", default-features = false }
+
 [target.'cfg(ldk_bench)'.dependencies]
 criterion = { version = "0.4", optional = true, default-features = false }
 

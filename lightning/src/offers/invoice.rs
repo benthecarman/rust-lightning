@@ -126,7 +126,7 @@ use crate::util::string::PrintableString;
 
 use crate::prelude::*;
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use std::time::SystemTime;
 
 pub(crate) const DEFAULT_RELATIVE_EXPIRY: Duration = Duration::from_secs(7200);
@@ -335,7 +335,7 @@ impl<'a> InvoiceBuilder<'a, ExplicitSigningPubkey> {
 	/// Builds an unsigned [`Bolt12Invoice`] after checking for valid semantics. It can be signed by
 	/// [`UnsignedBolt12Invoice::sign`].
 	pub fn build(self) -> Result<UnsignedBolt12Invoice, Bolt12SemanticError> {
-		#[cfg(feature = "std")] {
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))] {
 			if self.invoice.is_offer_or_refund_expired() {
 				return Err(Bolt12SemanticError::AlreadyExpired);
 			}
@@ -357,7 +357,7 @@ impl<'a> InvoiceBuilder<'a, DerivedSigningPubkey> {
 	pub fn build_and_sign<T: secp256k1::Signing>(
 		self, secp_ctx: &Secp256k1<T>
 	) -> Result<Bolt12Invoice, Bolt12SemanticError> {
-		#[cfg(feature = "std")] {
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))] {
 			if self.invoice.is_offer_or_refund_expired() {
 				return Err(Bolt12SemanticError::AlreadyExpired);
 			}
@@ -663,7 +663,7 @@ macro_rules! invoice_accessors { ($self: ident, $contents: expr) => {
 	}
 
 	/// Whether the invoice has expired.
-	#[cfg(feature = "std")]
+	#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 	pub fn is_expired(&$self) -> bool {
 		$contents.is_expired()
 	}
@@ -733,7 +733,7 @@ impl Bolt12Invoice {
 
 impl InvoiceContents {
 	/// Whether the original offer or refund has expired.
-	#[cfg(feature = "std")]
+	#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 	fn is_offer_or_refund_expired(&self) -> bool {
 		match self {
 			InvoiceContents::ForOffer { invoice_request, .. } =>
@@ -884,7 +884,7 @@ impl InvoiceContents {
 		self.fields().relative_expiry.unwrap_or(DEFAULT_RELATIVE_EXPIRY)
 	}
 
-	#[cfg(feature = "std")]
+	#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 	fn is_expired(&self) -> bool {
 		let absolute_expiry = self.created_at().checked_add(self.relative_expiry());
 		match absolute_expiry {
@@ -1368,7 +1368,7 @@ mod tests {
 		assert_eq!(unsigned_invoice.payment_paths(), payment_paths.as_slice());
 		assert_eq!(unsigned_invoice.created_at(), now);
 		assert_eq!(unsigned_invoice.relative_expiry(), DEFAULT_RELATIVE_EXPIRY);
-		#[cfg(feature = "std")]
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 		assert!(!unsigned_invoice.is_expired());
 		assert_eq!(unsigned_invoice.payment_hash(), payment_hash);
 		assert_eq!(unsigned_invoice.amount_msats(), 1000);
@@ -1410,7 +1410,7 @@ mod tests {
 		assert_eq!(invoice.payment_paths(), payment_paths.as_slice());
 		assert_eq!(invoice.created_at(), now);
 		assert_eq!(invoice.relative_expiry(), DEFAULT_RELATIVE_EXPIRY);
-		#[cfg(feature = "std")]
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 		assert!(!invoice.is_expired());
 		assert_eq!(invoice.payment_hash(), payment_hash);
 		assert_eq!(invoice.amount_msats(), 1000);
@@ -1507,7 +1507,7 @@ mod tests {
 		assert_eq!(invoice.payment_paths(), payment_paths.as_slice());
 		assert_eq!(invoice.created_at(), now);
 		assert_eq!(invoice.relative_expiry(), DEFAULT_RELATIVE_EXPIRY);
-		#[cfg(feature = "std")]
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 		assert!(!invoice.is_expired());
 		assert_eq!(invoice.payment_hash(), payment_hash);
 		assert_eq!(invoice.amount_msats(), 1000);
@@ -1719,7 +1719,7 @@ mod tests {
 			.build().unwrap()
 			.sign(recipient_sign).unwrap();
 		let (_, _, _, tlv_stream, _) = invoice.as_tlv_stream();
-		#[cfg(feature = "std")]
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 		assert!(!invoice.is_expired());
 		assert_eq!(invoice.relative_expiry(), one_hour);
 		assert_eq!(tlv_stream.relative_expiry, Some(one_hour.as_secs() as u32));
@@ -1735,7 +1735,7 @@ mod tests {
 			.build().unwrap()
 			.sign(recipient_sign).unwrap();
 		let (_, _, _, tlv_stream, _) = invoice.as_tlv_stream();
-		#[cfg(feature = "std")]
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 		assert!(invoice.is_expired());
 		assert_eq!(invoice.relative_expiry(), one_hour - Duration::from_secs(1));
 		assert_eq!(tlv_stream.relative_expiry, Some(one_hour.as_secs() as u32 - 1));

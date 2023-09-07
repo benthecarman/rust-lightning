@@ -2313,7 +2313,7 @@ fn do_automatic_retries(test: AutoRetry) {
 		let mut msg_events = nodes[0].node.get_and_clear_pending_msg_events();
 		assert_eq!(msg_events.len(), 0);
 	} else if test == AutoRetry::FailTimeout {
-		#[cfg(not(feature = "no-std"))] {
+		#[cfg(all(not(feature = "no-std"), not(target_arch = "wasm32")))] {
 			// Ensure ChannelManager will not retry a payment if it times out due to Retry::Timeout.
 			nodes[0].node.send_payment(payment_hash, RecipientOnionFields::secret_only(payment_secret),
 				PaymentId(payment_hash.0), route_params, Retry::Timeout(Duration::from_secs(60))).unwrap();
