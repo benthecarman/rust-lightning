@@ -93,10 +93,10 @@ mod tests {
 	use std::time::SystemTime;
 
 	fn duration_since_epoch() -> Duration {
-		#[cfg(feature = "std")]
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 		let duration_since_epoch =
 			SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
-		#[cfg(not(feature = "std"))]
+		#[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
 		let duration_since_epoch = Duration::from_secs(1234567);
 		duration_since_epoch
 	}

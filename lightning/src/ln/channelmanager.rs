@@ -6017,11 +6017,11 @@ where
 				self.finish_close_channel(shutdown_res);
 			}
 
-			#[cfg(feature = "std")]
+			#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 			let duration_since_epoch = std::time::SystemTime::now()
 				.duration_since(std::time::SystemTime::UNIX_EPOCH)
 				.expect("SystemTime::now() should come after SystemTime::UNIX_EPOCH");
-			#[cfg(not(feature = "std"))]
+			#[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
 			let duration_since_epoch = Duration::from_secs(
 				self.highest_seen_timestamp.load(Ordering::Acquire).saturating_sub(7200) as u64
 			);
@@ -8848,15 +8848,15 @@ where
 				)
 					.map_err(|_| Bolt12SemanticError::MissingPaths)?;
 
-				#[cfg(feature = "std")]
+				#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 				let builder = refund.respond_using_derived_keys(
 					payment_paths, payment_hash, expanded_key, entropy
 				)?;
-				#[cfg(not(feature = "std"))]
+				#[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
 				let created_at = Duration::from_secs(
 					self.highest_seen_timestamp.load(Ordering::Acquire) as u64
 				);
-				#[cfg(not(feature = "std"))]
+				#[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
 				let builder = refund.respond_using_derived_keys_no_std(
 					payment_paths, payment_hash, created_at, expanded_key, entropy
 				)?;
@@ -10397,17 +10397,17 @@ where
 					},
 				};
 
-				#[cfg(not(feature = "std"))]
+				#[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
 				let created_at = Duration::from_secs(
 					self.highest_seen_timestamp.load(Ordering::Acquire) as u64
 				);
 
 				let response = if invoice_request.keys.is_some() {
-					#[cfg(feature = "std")]
+					#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 					let builder = invoice_request.respond_using_derived_keys(
 						payment_paths, payment_hash
 					);
-					#[cfg(not(feature = "std"))]
+					#[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
 					let builder = invoice_request.respond_using_derived_keys_no_std(
 						payment_paths, payment_hash, created_at
 					);
@@ -10416,9 +10416,9 @@ where
 						.and_then(|builder| builder.allow_mpp().build_and_sign(secp_ctx))
 						.map_err(InvoiceError::from)
 				} else {
-					#[cfg(feature = "std")]
+					#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 					let builder = invoice_request.respond_with(payment_paths, payment_hash);
-					#[cfg(not(feature = "std"))]
+					#[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
 					let builder = invoice_request.respond_with_no_std(
 						payment_paths, payment_hash, created_at
 					);

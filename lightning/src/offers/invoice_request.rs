@@ -306,7 +306,7 @@ macro_rules! invoice_request_builder_methods { (
 		(UnsignedInvoiceRequest, Option<KeyPair>, Option<&'b Secp256k1<$secp_context>>),
 		Bolt12SemanticError
 	> {
-		#[cfg(feature = "std")] {
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))] {
 			if $self.offer.is_expired() {
 				return Err(Bolt12SemanticError::AlreadyExpired);
 			}
@@ -705,7 +705,7 @@ macro_rules! invoice_request_respond_with_explicit_signing_pubkey_methods { (
 	/// creation time is used for the `created_at` parameter.
 	///
 	/// [`Duration`]: core::time::Duration
-	#[cfg(feature = "std")]
+	#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 	pub fn respond_with(
 		&$self, payment_paths: Vec<(BlindedPayInfo, BlindedPath)>, payment_hash: PaymentHash
 	) -> Result<$builder, Bolt12SemanticError> {
@@ -844,7 +844,7 @@ macro_rules! invoice_request_respond_with_derived_signing_pubkey_methods { (
 	/// See [`InvoiceRequest::respond_with`] for further details.
 	///
 	/// [`Bolt12Invoice`]: crate::offers::invoice::Bolt12Invoice
-	#[cfg(feature = "std")]
+	#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 	pub fn respond_using_derived_keys(
 		&$self, payment_paths: Vec<(BlindedPayInfo, BlindedPath)>, payment_hash: PaymentHash
 	) -> Result<$builder, Bolt12SemanticError> {
