@@ -4599,11 +4599,8 @@ impl<SP: Deref> Channel<SP> where
 				next_counterparty_commitment_number,
 			)))
 		} else {
-			Err(ChannelError::Close(format!(
-				"Peer attempted to reestablish channel with a future remote commitment transaction: {} (received) vs {} (expected)",
-				msg.next_local_commitment_number,
-				next_counterparty_commitment_number,
-			)))
+			log_error!(logger, "Peer attempted to reestablish channel with a future remote commitment transaction: {} (received) vs {} (expected)", msg.next_local_commitment_number, next_counterparty_commitment_number);
+			panic!("Peer attempted to reestablish channel with a future remote commitment transaction: {} (received) vs {} (expected)", msg.next_local_commitment_number, next_counterparty_commitment_number);
 		}
 	}
 
