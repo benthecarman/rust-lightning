@@ -7079,8 +7079,8 @@ where
 						node_id: *counterparty_node_id,
 						msg: msgs::ChannelReestablish {
 							channel_id: msg.channel_id,
-							next_local_commitment_number: 0,
-							next_remote_commitment_number: 0,
+							next_commitment_number: 0,
+							next_revocation_number: 0,
 							your_last_per_commitment_secret: [1u8; 32],
 							my_current_per_commitment_point: PublicKey::from_slice(&[2u8; 33]).unwrap(),
 							next_funding_txid: None,
@@ -12107,8 +12107,8 @@ mod tests {
 		assert_eq!(msg_events.len(), 2);
 		if let MessageSendEvent::SendChannelReestablish { node_id, msg } = &msg_events[0] {
 			assert_eq!(*node_id, nodes[1].node.get_our_node_id());
-			assert_eq!(msg.next_local_commitment_number, 0);
-			assert_eq!(msg.next_remote_commitment_number, 0);
+			assert_eq!(msg.next_commitment_number, 0);
+			assert_eq!(msg.next_revocation_number, 0);
 			nodes[1].node.handle_channel_reestablish(&nodes[0].node.get_our_node_id(), &msg);
 		} else { panic!() };
 		check_closed_broadcast(&nodes[1], 1, true);

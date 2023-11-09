@@ -4147,20 +4147,22 @@ impl<SP: Deref> Channel<SP> where
 			return Err(ChannelError::Close("Peer sent a loose channel_reestablish not after reconnect".to_owned()));
 		}
 
-		if msg.next_local_commitment_number >= INITIAL_COMMITMENT_NUMBER || msg.next_remote_commitment_number >= INITIAL_COMMITMENT_NUMBER ||
-			msg.next_local_commitment_number == 0 {
+		if msg.next_commitment_number >= INITIAL_COMMITMENT_NUMBER || msg.next_revocation_number >= INITIAL_COMMITMENT_NUMBER ||
+			msg.next_commitment_number == 0 {
 			return Err(ChannelError::Close("Peer sent an invalid channel_reestablish to force close in a non-standard way".to_owned()));
 		}
 
 		let our_commitment_transaction = INITIAL_COMMITMENT_NUMBER - self.context.cur_holder_commitment_transaction_number - 1;
-		if msg.next_remote_commitment_number > 0 {
-			let expected_point = self.context.holder_signer.as_ref().get_per_commitment_point(INITIAL_COMMITMENT_NUMBER - msg.next_remote_commitment_number + 1, &self.context.secp_ctx);
+		if msg.next_revocation_number > 0 {
+			let expected_point = self.context.holder_signer.as_ref().get_per_commitment_point(INITIAL_COMMITMENT_NUMBER - msg.next_revocation_number + 1, &self.context.secp_ctx);
 			let given_secret = SecretKey::from_slice(&msg.your_last_per_commitment_secret)
 				.map_err(|_| ChannelError::Close("Peer sent a garbage channel_reestablish with unparseable secret key".to_owned()))?;
+
 			if expected_point != PublicKey::from_secret_key(&self.context.secp_ctx, &given_secret) {
 				return Err(ChannelError::Close("Peer sent a garbage channel_reestablish with secret key not matching the commitment height provided".to_owned()));
 			}
-			if msg.next_remote_commitment_number > our_commitment_transaction {
+
+			if msg.next_revocation_number > our_commitment_transaction {
 				macro_rules! log_and_panic {
 					($err_msg: expr) => {
 						log_error!(logger, $err_msg, &self.context.channel_id, log_pubkey!(self.context.counterparty_node_id));
@@ -4180,10 +4182,10 @@ impl<SP: Deref> Channel<SP> where
 
 		// Before we change the state of the channel, we check if the peer is sending a very old
 		// commitment transaction number, if yes we send a warning message.
-		if msg.next_remote_commitment_number + 1 < our_commitment_transaction {
+		if msg.next_revocation_number + 1 < our_commitment_transaction {
 			return Err(ChannelError::Warn(format!(
 				"Peer attempted to reestablish channel with a very old local commitment transaction: {} (received) vs {} (expected)",
-				msg.next_remote_commitment_number,
+				msg.next_revocation_number,
 				our_commitment_transaction
 			)));
 		}
@@ -4201,7 +4203,7 @@ impl<SP: Deref> Channel<SP> where
 			// If we're waiting on a monitor update, we shouldn't re-send any channel_ready's.
 			if self.context.channel_state & (ChannelState::OurChannelReady as u32) == 0 ||
 					self.context.channel_state & (ChannelState::MonitorUpdateInProgress as u32) != 0 {
-				if msg.next_remote_commitment_number != 0 {
+				if msg.next_revocation_number != 0 {
 					return Err(ChannelError::Close("Peer claimed they saw a revoke_and_ack but we haven't sent channel_ready yet".to_owned()));
 				}
 				// Short circuit the whole handler as there is nothing we can resend them
@@ -4227,11 +4229,11 @@ impl<SP: Deref> Channel<SP> where
 			});
 		}
 
-		let required_revoke = if msg.next_remote_commitment_number == our_commitment_transaction {
+		let required_revoke = if msg.next_revocation_number == our_commitment_transaction {
 			// Remote isn't waiting on any RevokeAndACK from us!
 			// Note that if we need to repeat our ChannelReady we'll do that in the next if block.
 			None
-		} else if msg.next_remote_commitment_number + 1 == our_commitment_transaction {
+		} else if msg.next_revocation_number + 1 == our_commitment_transaction {
 			if self.context.channel_state & (ChannelState::MonitorUpdateInProgress as u32) != 0 {
 				self.context.monitor_pending_revoke_and_ack = true;
 				None
@@ -4242,7 +4244,7 @@ impl<SP: Deref> Channel<SP> where
 			debug_assert!(false, "All values should have been handled in the four cases above");
 			return Err(ChannelError::Close(format!(
 				"Peer attempted to reestablish channel expecting a future local commitment transaction: {} (received) vs {} (expected)",
-				msg.next_remote_commitment_number,
+				msg.next_revocation_number,
 				our_commitment_transaction
 			)));
 		};
@@ -4257,7 +4259,7 @@ impl<SP: Deref> Channel<SP> where
 		}
 		let next_counterparty_commitment_number = INITIAL_COMMITMENT_NUMBER - self.context.cur_counterparty_commitment_transaction_number + if is_awaiting_remote_revoke { 1 } else { 0 };
 
-		let channel_ready = if msg.next_local_commitment_number == 1 && INITIAL_COMMITMENT_NUMBER - self.context.cur_holder_commitment_transaction_number == 1 {
+		let channel_ready = if msg.next_commitment_number == 1 && INITIAL_COMMITMENT_NUMBER - self.context.cur_holder_commitment_transaction_number == 1 {
 			// We should never have to worry about MonitorUpdateInProgress resending ChannelReady
 			let next_per_commitment_point = self.context.holder_signer.as_ref().get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
 			Some(msgs::ChannelReady {
@@ -4267,7 +4269,7 @@ impl<SP: Deref> Channel<SP> where
 			})
 		} else { None };
 
-		if msg.next_local_commitment_number == next_counterparty_commitment_number {
+		if msg.next_commitment_number == next_counterparty_commitment_number {
 			if required_revoke.is_some() {
 				log_debug!(logger, "Reconnected channel {} with only lost outbound RAA", &self.context.channel_id());
 			} else {
@@ -4280,7 +4282,7 @@ impl<SP: Deref> Channel<SP> where
 				commitment_update: None,
 				order: self.context.resend_order.clone(),
 			})
-		} else if msg.next_local_commitment_number == next_counterparty_commitment_number - 1 {
+		} else if msg.next_commitment_number == next_counterparty_commitment_number - 1 {
 			if required_revoke.is_some() {
 				log_debug!(logger, "Reconnected channel {} with lost outbound RAA and lost remote commitment tx", &self.context.channel_id());
 			} else {
@@ -4302,16 +4304,16 @@ impl<SP: Deref> Channel<SP> where
 					order: self.context.resend_order.clone(),
 				})
 			}
-		} else if msg.next_local_commitment_number < next_counterparty_commitment_number {
+		} else if msg.next_commitment_number < next_counterparty_commitment_number {
 			Err(ChannelError::Close(format!(
 				"Peer attempted to reestablish channel with a very old local commitment transaction: {} (received) vs {} (expected)",
-				msg.next_local_commitment_number,
+				msg.next_commitment_number,
 				next_counterparty_commitment_number,
 			)))
 		} else {
 			Err(ChannelError::Close(format!(
 				"Peer attempted to reestablish channel with a future local commitment transaction: {} (received) vs {} (expected)",
-				msg.next_local_commitment_number,
+				msg.next_commitment_number,
 				next_counterparty_commitment_number,
 			)))
 		}
@@ -5429,7 +5431,7 @@ impl<SP: Deref> Channel<SP> where
 
 			// next_local_commitment_number is the next commitment_signed number we expect to
 			// receive (indicating if they need to resend one that we missed).
-			next_local_commitment_number: INITIAL_COMMITMENT_NUMBER - self.context.cur_holder_commitment_transaction_number,
+			next_commitment_number: INITIAL_COMMITMENT_NUMBER - self.context.cur_holder_commitment_transaction_number,
 			// We have to set next_remote_commitment_number to the next revoke_and_ack we expect to
 			// receive, however we track it by the next commitment number for a remote transaction
 			// (which is one further, as they always revoke previous commitment transaction, not
@@ -5437,7 +5439,7 @@ impl<SP: Deref> Channel<SP> where
 			// cur_counterparty_commitment_transaction_number is INITIAL_COMMITMENT_NUMBER we will have
 			// dropped this channel on disconnect as it hasn't yet reached FundingSent so we can't
 			// overflow here.
-			next_remote_commitment_number: INITIAL_COMMITMENT_NUMBER - self.context.cur_counterparty_commitment_transaction_number - 1,
+			next_revocation_number: INITIAL_COMMITMENT_NUMBER - self.context.cur_counterparty_commitment_transaction_number - 1,
 			your_last_per_commitment_secret: remote_last_secret,
 			my_current_per_commitment_point: dummy_pubkey,
 			// TODO(dual_funding): If we've sent `commtiment_signed` for an interactive transaction
@@ -8125,16 +8127,16 @@ mod tests {
 		// Node B's channel_reestablish message is sane.
 		assert!(node_b_chan.remove_uncommitted_htlcs_and_mark_paused(&&logger).is_ok());
 		let msg = node_b_chan.get_channel_reestablish(&&logger);
-		assert_eq!(msg.next_local_commitment_number, 1); // now called next_commitment_number
-		assert_eq!(msg.next_remote_commitment_number, 0); // now called next_revocation_number
+		assert_eq!(msg.next_commitment_number, 1); // now called next_commitment_number
+		assert_eq!(msg.next_revocation_number, 0); // now called next_revocation_number
 		assert_eq!(msg.your_last_per_commitment_secret, [0; 32]);
 
 		// Check that the commitment point in Node A's channel_reestablish message
 		// is sane.
 		assert!(node_a_chan.remove_uncommitted_htlcs_and_mark_paused(&&logger).is_ok());
 		let msg = node_a_chan.get_channel_reestablish(&&logger);
-		assert_eq!(msg.next_local_commitment_number, 1); // now called next_commitment_number
-		assert_eq!(msg.next_remote_commitment_number, 0); // now called next_revocation_number
+		assert_eq!(msg.next_commitment_number, 1); // now called next_commitment_number
+		assert_eq!(msg.next_revocation_number, 0); // now called next_revocation_number
 		assert_eq!(msg.your_last_per_commitment_secret, [0; 32]);
 	}
 

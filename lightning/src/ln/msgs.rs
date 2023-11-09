@@ -730,9 +730,9 @@ pub struct ChannelReestablish {
 	/// The channel ID
 	pub channel_id: ChannelId,
 	/// The next commitment number for the sender
-	pub next_local_commitment_number: u64,
+	pub next_commitment_number: u64,
 	/// The next commitment number for the recipient
-	pub next_remote_commitment_number: u64,
+	pub next_revocation_number: u64,
 	/// Proof that the sender knows the per-commitment secret of a specific commitment transaction
 	/// belonging to the recipient
 	pub your_last_per_commitment_secret: [u8; 32],
@@ -1880,8 +1880,8 @@ impl_writeable_msg!(AnnouncementSignatures, {
 
 impl_writeable_msg!(ChannelReestablish, {
 	channel_id,
-	next_local_commitment_number,
-	next_remote_commitment_number,
+	next_commitment_number,
+	next_revocation_number,
 	your_last_per_commitment_secret,
 	my_current_per_commitment_point,
 }, {
@@ -2761,8 +2761,8 @@ mod tests {
 
 		let cr = msgs::ChannelReestablish {
 			channel_id: ChannelId::from_bytes([4, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]),
-			next_local_commitment_number: 3,
-			next_remote_commitment_number: 4,
+			next_commitment_number: 3,
+			next_revocation_number: 4,
 			your_last_per_commitment_secret: [9;32],
 			my_current_per_commitment_point: public_key,
 			next_funding_txid: None,
@@ -2790,8 +2790,8 @@ mod tests {
 
 		let cr = msgs::ChannelReestablish {
 			channel_id: ChannelId::from_bytes([4, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]),
-			next_local_commitment_number: 3,
-			next_remote_commitment_number: 4,
+			next_commitment_number: 3,
+			next_revocation_number: 4,
 			your_last_per_commitment_secret: [9;32],
 			my_current_per_commitment_point: public_key,
 			next_funding_txid: Some(Txid::from_hash(bitcoin::hashes::Hash::from_slice(&[

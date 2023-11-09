@@ -3255,7 +3255,7 @@ pub fn reconnect_nodes<'a, 'b, 'c, 'd>(args: ReconnectArgs<'a, 'b, 'c, 'd>) {
 		// If a expects a channel_ready, it better not think it has received a revoke_and_ack
 		// from b
 		for reestablish in reestablish_1.iter() {
-			let n = reestablish.next_remote_commitment_number;
+			let n = reestablish.next_revocation_number;
 			assert_eq!(n, 0, "expected a->b next_remote_commitment_number to be 0, got {}", n);
 		}
 	}
@@ -3263,7 +3263,7 @@ pub fn reconnect_nodes<'a, 'b, 'c, 'd>(args: ReconnectArgs<'a, 'b, 'c, 'd>) {
 		// If b expects a channel_ready, it better not think it has received a revoke_and_ack
 		// from a
 		for reestablish in reestablish_2.iter() {
-			let n = reestablish.next_remote_commitment_number;
+			let n = reestablish.next_revocation_number;
 			assert_eq!(n, 0, "expected b->a next_remote_commitment_number to be 0, got {}", n);
 		}
 	}
@@ -3271,11 +3271,11 @@ pub fn reconnect_nodes<'a, 'b, 'c, 'd>(args: ReconnectArgs<'a, 'b, 'c, 'd>) {
 		// If we expect any channel_ready's, both sides better have set
 		// next_holder_commitment_number to 1
 		for reestablish in reestablish_1.iter() {
-			let n = reestablish.next_local_commitment_number;
+			let n = reestablish.next_commitment_number;
 			assert_eq!(n, 1, "expected a->b next_local_commitment_number to be 1, got {}", n);
 		}
 		for reestablish in reestablish_2.iter() {
-			let n = reestablish.next_local_commitment_number;
+			let n = reestablish.next_commitment_number;
 			assert_eq!(n, 1, "expected b->a next_local_commitment_number to be 1, got {}", n);
 		}
 	}
