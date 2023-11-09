@@ -4325,7 +4325,7 @@ impl<SP: Deref> Channel<SP> where
 		// if next_commitment_number is not 1 greater than the commitment number of the last commitment_signed message the receiving node has sent:
 		//
 		//     SHOULD send an error and fail the channel.
-		else if msg.next_commitment_number < next_counterparty_commitment_number {
+		else if msg.next_commitment_number < next_counterparty_commitment_number - 1 {
 			Err(ChannelError::Close(format!(
 				"Peer attempted to reestablish channel with a very old local commitment transaction: {} (received) vs {} (expected)",
 				msg.next_commitment_number,
