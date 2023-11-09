@@ -4157,11 +4157,17 @@ impl<SP: Deref> Channel<SP> where
 			let expected_point = self.context.holder_signer.as_ref().get_per_commitment_point(INITIAL_COMMITMENT_NUMBER - msg.next_revocation_number + 1, &self.context.secp_ctx);
 			let given_secret = SecretKey::from_slice(&msg.your_last_per_commitment_secret)
 				.map_err(|_| ChannelError::Close("Peer sent a garbage channel_reestablish with unparseable secret key".to_owned()))?;
-
+			// if your_last_per_commitment_secret does not match the expected values:
+			//
+			//     SHOULD send an error and fail the channel.
 			if expected_point != PublicKey::from_secret_key(&self.context.secp_ctx, &given_secret) {
 				return Err(ChannelError::Close("Peer sent a garbage channel_reestablish with secret key not matching the commitment height provided".to_owned()));
 			}
-
+			// if next_revocation_number is greater than expected above, AND your_last_per_commitment_secret is correct for that next_revocation_number minus 1:
+			//
+			//     MUST NOT broadcast its commitment transaction.
+			//     ** SHOULD send an error to request the peer to fail the channel.
+			//     We panic instead because sending an error could cause us to lose funds.
 			if msg.next_revocation_number > our_commitment_transaction {
 				macro_rules! log_and_panic {
 					($err_msg: expr) => {
@@ -4229,6 +4235,11 @@ impl<SP: Deref> Channel<SP> where
 			});
 		}
 
+		// if next_revocation_number is equal to the commitment number of the last revoke_and_ack the receiving node sent, AND the receiving node hasn't already received a closing_signed:
+		//
+		//     MUST re-send the revoke_and_ack.
+		//     if it has previously sent a commitment_signed that needs to be retransmitted:
+		//         MUST retransmit revoke_and_ack and commitment_signed in the same relative order as initially transmitted.
 		let required_revoke = if msg.next_revocation_number == our_commitment_transaction {
 			// Remote isn't waiting on any RevokeAndACK from us!
 			// Note that if we need to repeat our ChannelReady we'll do that in the next if block.
@@ -4259,6 +4270,9 @@ impl<SP: Deref> Channel<SP> where
 		}
 		let next_counterparty_commitment_number = INITIAL_COMMITMENT_NUMBER - self.context.cur_counterparty_commitment_transaction_number + if is_awaiting_remote_revoke { 1 } else { 0 };
 
+		// if next_commitment_number is 1 in both the channel_reestablish it sent and received:
+		//
+		//     MUST retransmit channel_ready.
 		let channel_ready = if msg.next_commitment_number == 1 && INITIAL_COMMITMENT_NUMBER - self.context.cur_holder_commitment_transaction_number == 1 {
 			// We should never have to worry about MonitorUpdateInProgress resending ChannelReady
 			let next_per_commitment_point = self.context.holder_signer.as_ref().get_per_commitment_point(self.context.cur_holder_commitment_transaction_number, &self.context.secp_ctx);
@@ -4269,6 +4283,9 @@ impl<SP: Deref> Channel<SP> where
 			})
 		} else { None };
 
+		// if next_commitment_number is equal to the commitment number of the last commitment_signed message the receiving node has sent:
+		//
+		//     MUST reuse the same commitment number for its next commitment_signed.
 		if msg.next_commitment_number == next_counterparty_commitment_number {
 			if required_revoke.is_some() {
 				log_debug!(logger, "Reconnected channel {} with only lost outbound RAA", &self.context.channel_id());
@@ -4304,7 +4321,11 @@ impl<SP: Deref> Channel<SP> where
 					order: self.context.resend_order.clone(),
 				})
 			}
-		} else if msg.next_commitment_number < next_counterparty_commitment_number {
+		}
+		// if next_commitment_number is not 1 greater than the commitment number of the last commitment_signed message the receiving node has sent:
+		//
+		//     SHOULD send an error and fail the channel.
+		else if msg.next_commitment_number < next_counterparty_commitment_number {
 			Err(ChannelError::Close(format!(
 				"Peer attempted to reestablish channel with a very old local commitment transaction: {} (received) vs {} (expected)",
 				msg.next_commitment_number,
