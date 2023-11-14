@@ -4529,12 +4529,8 @@ impl<SP: Deref> Channel<SP> where
 				Some(self.get_last_revoke_and_ack())
 			}
 		} else {
-			debug_assert!(false, "All values should have been handled in the four cases above");
-			return Err(ChannelError::Close(format!(
-				"Peer attempted to reestablish channel expecting a future local commitment transaction: {} (received) vs {} (expected)",
-				msg.next_remote_commitment_number,
-				our_commitment_transaction
-			)));
+			log_error!(logger, "Peer attempted to reestablish channel expecting a future local commitment transaction: {} (received) vs {} (expected)", msg.next_remote_commitment_number, our_commitment_transaction);
+			panic!("Peer attempted to reestablish channel with a future remote commitment transaction: {} (received) vs {} (expected)", msg.next_local_commitment_number, our_commitment_transaction);
 		};
 
 		// We increment cur_counterparty_commitment_transaction_number only upon receipt of
