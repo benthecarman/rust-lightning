@@ -11903,7 +11903,9 @@ where
 					log_error!(logger, " Without the latest ChannelMonitor we cannot continue without risking funds.");
 					log_error!(logger, " Please ensure the chain::Watch API requirements are met and file a bug report at https://github.com/lightningdevkit/rust-lightning");
 					log_error!(logger, " Pending in-flight updates are: {:?}", chan_in_flight_updates);
-					return Err(DecodeError::InvalidValue);
+					// Allow this, it is only really unsafe for people routing payments, which mutiny does not do. This will unblock https://github.com/MutinyWallet/mutiny-web/issues/1032
+					// Eventually we can revert this after https://github.com/lightningdevkit/rust-lightning/pull/2957 and https://github.com/lightningdevkit/rust-lightning/pull/2964
+					// return Err(DecodeError::InvalidValue);
 				}
 			}
 		}
