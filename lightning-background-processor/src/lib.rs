@@ -98,7 +98,7 @@ const FRESHNESS_TIMER: u64 = 60;
 const FRESHNESS_TIMER: u64 = 1;
 
 #[cfg(all(not(test), not(debug_assertions)))]
-const PING_TIMER: u64 = 10;
+const PING_TIMER: u64 = 30;
 /// Signature operations take a lot longer without compiler optimisations.
 /// Increasing the ping timer allows for this but slower devices will be disconnected if the
 /// timeout is reached.
