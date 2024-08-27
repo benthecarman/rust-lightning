@@ -38,3 +38,6 @@ lto = "off"
 opt-level = 3
 lto = true
 panic = "abort"
+
+[patch.crates-io]
+bitcoin = { git = "https://github.com/benthecarman/rust-bitcoin.git", branch = "testnet4-30-2" }

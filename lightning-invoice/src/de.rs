@@ -185,7 +185,7 @@ impl FromStr for super::Currency {
 	fn from_str(currency_prefix: &str) -> Result<Self, Bolt11ParseError> {
 		match currency_prefix {
 			"bc" => Ok(Currency::Bitcoin),
-			"tb" => Ok(Currency::BitcoinTestnet),
+			"tb" => Ok(Currency::BitcoinTestnet4),
 			"bcrt" => Ok(Currency::Regtest),
 			"sb" => Ok(Currency::Simnet),
 			"tbs" => Ok(Currency::Signet),

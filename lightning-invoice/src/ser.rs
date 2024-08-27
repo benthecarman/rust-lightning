@@ -151,7 +151,8 @@ impl Display for Currency {
 	fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
 		let currency_code = match *self {
 			Currency::Bitcoin => "bc",
-			Currency::BitcoinTestnet => "tb",
+			Currency::BitcoinTestnet => "tbdeprecated",
+			Currency::BitcoinTestnet4 => "tb",
 			Currency::Regtest => "bcrt",
 			Currency::Simnet => "sb",
 			Currency::Signet => "tbs",
