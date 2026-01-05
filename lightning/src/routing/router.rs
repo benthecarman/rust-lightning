@@ -126,6 +126,24 @@ where
 	}
 
 	#[rustfmt::skip]
+	fn find_route_with_partial_amount(
+		&self,
+		payer: &PublicKey,
+		params: &RouteParameters,
+		partial_amount_msat: Option<u64>,
+		first_hops: Option<&[&ChannelDetails]>,
+		inflight_htlcs: InFlightHtlcs
+	) -> Result<Route, &'static str> {
+		let random_seed_bytes = self.entropy_source.get_secure_random_bytes();
+		find_route_with_partial_amount(
+			payer, params, partial_amount_msat, &self.network_graph, first_hops, &*self.logger,
+			&ScorerAccountingForInFlightHtlcs::new(self.scorer.read_lock(), &inflight_htlcs),
+			&self.score_params,
+			&random_seed_bytes
+		)
+	}
+
+	#[rustfmt::skip]
 	fn create_blinded_payment_paths<
 		T: secp256k1::Signing + secp256k1::Verification
 	> (
@@ -280,6 +298,36 @@ pub trait Router {
 		_payment_hash: PaymentHash, _payment_id: PaymentId,
 	) -> Result<Route, &'static str> {
 		self.find_route(payer, route_params, first_hops, inflight_htlcs)
+	}
+
+	/// Finds a [`Route`] for a payment between the given `payer` and a payee.
+	///
+	/// The `payee` is given in [`RouteParameters::payment_params`]. If `partial_amount_msat` is
+	/// provided, it will be used as the payment amount instead of [`RouteParameters::final_value_msat`].
+	/// This allows for partial invoice payments where the amount sent may be less than the invoice amount.
+	#[rustfmt::skip]
+	fn find_route_with_partial_amount(
+		&self, payer: &PublicKey, route_params: &RouteParameters, _partial_amount_msat: Option<u64>,
+		first_hops: Option<&[&ChannelDetails]>, inflight_htlcs: InFlightHtlcs
+	) -> Result<Route, &'static str> {
+		// Default implementation ignores the partial amount and delegates to find_route
+		self.find_route(payer, route_params, first_hops, inflight_htlcs)
+	}
+
+	/// Finds a [`Route`] for a payment between the given `payer` and a payee.
+	///
+	/// The `payee` is given in [`RouteParameters::payment_params`]. If `partial_amount_msat` is
+	/// provided, it will be used as the payment amount instead of [`RouteParameters::final_value_msat`].
+	/// This allows for partial invoice payments where the amount sent may be less than the invoice amount.
+	///
+	/// Includes a [`PaymentHash`] and a [`PaymentId`] to be able to correlate the request with a specific
+	/// payment.
+	fn find_route_with_partial_amount_and_id(
+		&self, payer: &PublicKey, route_params: &RouteParameters, partial_amount_msat: Option<u64>,
+		first_hops: Option<&[&ChannelDetails]>, inflight_htlcs: InFlightHtlcs,
+		_payment_hash: PaymentHash, _payment_id: PaymentId,
+	) -> Result<Route, &'static str> {
+		self.find_route_with_partial_amount(payer, route_params, partial_amount_msat, first_hops, inflight_htlcs)
 	}
 
 	/// Creates [`BlindedPaymentPath`]s for payment to the `recipient` node. The channels in `first_hops`
@@ -2457,8 +2505,31 @@ pub fn find_route<L: Deref, GL: Deref, S: ScoreLookUp>(
 	scorer: &S, score_params: &S::ScoreParams, random_seed_bytes: &[u8; 32]
 ) -> Result<Route, &'static str>
 where L::Target: Logger, GL::Target: Logger {
+	find_route_with_partial_amount(our_node_pubkey, route_params, None, network_graph, first_hops, logger,
+		scorer, score_params, random_seed_bytes)
+}
+
+/// Finds a route from us (payer) to the given target node (payee) with an optional partial payment amount.
+///
+/// This function is similar to [`find_route`], but allows specifying a `partial_amount_msat` that will
+/// be used instead of [`RouteParameters::final_value_msat`] when finding the route. This enables partial
+/// invoice payments where you want to send less than the full invoice amount.
+///
+/// If `partial_amount_msat` is `None`, this behaves identically to [`find_route`] and uses the
+/// [`RouteParameters::final_value_msat`] value.
+///
+/// If `partial_amount_msat` is `Some`, the routing algorithm will find a route for that specific amount,
+/// which should be less than or equal to [`RouteParameters::final_value_msat`].
+///
+/// See [`find_route`] for additional documentation on the routing algorithm and parameters.
+pub fn find_route_with_partial_amount<L: Deref, GL: Deref, S: ScoreLookUp>(
+	our_node_pubkey: &PublicKey, route_params: &RouteParameters, partial_amount_msat: Option<u64>,
+	network_graph: &NetworkGraph<GL>, first_hops: Option<&[&ChannelDetails]>, logger: L,
+	scorer: &S, score_params: &S::ScoreParams, random_seed_bytes: &[u8; 32]
+) -> Result<Route, &'static str>
+where L::Target: Logger, GL::Target: Logger {
 	let graph_lock = network_graph.read_only();
-	let mut route = get_route(our_node_pubkey, &route_params, &graph_lock, first_hops, logger,
+	let mut route = get_route(our_node_pubkey, &route_params, partial_amount_msat, &graph_lock, first_hops, logger,
 		scorer, score_params, random_seed_bytes)?;
 	add_random_cltv_offset(&mut route, &route_params.payment_params, &graph_lock, random_seed_bytes);
 	Ok(route)
@@ -2466,7 +2537,7 @@ where L::Target: Logger, GL::Target: Logger {
 
 #[rustfmt::skip]
 pub(crate) fn get_route<L: Deref, S: ScoreLookUp>(
-	our_node_pubkey: &PublicKey, route_params: &RouteParameters, network_graph: &ReadOnlyNetworkGraph,
+	our_node_pubkey: &PublicKey, route_params: &RouteParameters, partial_amount_msat: Option<u64>, network_graph: &ReadOnlyNetworkGraph,
 	first_hops: Option<&[&ChannelDetails]>, logger: L, scorer: &S, score_params: &S::ScoreParams,
 	_random_seed_bytes: &[u8; 32]
 ) -> Result<Route, &'static str>
@@ -2474,7 +2545,7 @@ where L::Target: Logger {
 
 	let payment_params = &route_params.payment_params;
 	let max_path_length = core::cmp::min(payment_params.max_path_length, MAX_PATH_LENGTH_ESTIMATE);
-	let final_value_msat = route_params.final_value_msat;
+	let final_value_msat = partial_amount_msat.unwrap_or(route_params.final_value_msat);
 	// If we're routing to a blinded recipient, we won't have their node id. Therefore, keep the
 	// unblinded payee id as an option. We also need a non-optional "payee id" for path construction,
 	// so use a dummy id for this in the blinded case.
@@ -3917,7 +3988,7 @@ fn build_route_from_hops_internal<L: Deref>(
 
 	let scorer = HopScorer { our_node_id, hop_ids };
 
-	get_route(our_node_pubkey, route_params, network_graph, None, logger, &scorer, &Default::default(), random_seed_bytes)
+	get_route(our_node_pubkey, route_params, None, network_graph, None, logger, &scorer, &Default::default(), random_seed_bytes)
 }
 
 #[cfg(test)]
@@ -4051,7 +4122,7 @@ mod tests {
 
 		let route_params = RouteParameters::from_payment_params_and_value(
 			payment_params.clone(), 0);
-		if let Err(err) = get_route(&our_id,
+		if let Err(err) = get_route(&our_id, &route_params, None,
 			&route_params, &network_graph.read_only(), None, Arc::clone(&logger), &scorer,
 			&Default::default(), &random_seed_bytes) {
 				assert_eq!(err, "Cannot send a payment of 0 msat");
@@ -4059,7 +4130,7 @@ mod tests {
 
 		payment_params.max_path_length = 2;
 		let mut route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 2);
 
@@ -4078,7 +4149,7 @@ mod tests {
 		assert_eq!(route.paths[0].hops[1].channel_features.le_flags(), &id_to_feature_flags(4));
 
 		route_params.payment_params.max_path_length = 1;
-		get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap_err();
 	}
 
@@ -4096,13 +4167,13 @@ mod tests {
 		let our_chans = [get_channel_details(Some(2), our_id, InitFeatures::from_le_bytes(vec![0b11]), 100000)];
 
 		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
-		if let Err(err) = get_route(&our_id,
+		if let Err(err) = get_route(&our_id, &route_params, None,
 			&route_params, &network_graph.read_only(), Some(&our_chans.iter().collect::<Vec<_>>()),
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes) {
 				assert_eq!(err, "First hop cannot have our_node_pubkey as a destination.");
 		} else { panic!(); }
 
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 2);
 	}
@@ -4220,7 +4291,7 @@ mod tests {
 		// Not possible to send 199_999_999, because the minimum on channel=2 is 200_000_000.
 		let route_params = RouteParameters::from_payment_params_and_value(
 			payment_params, 199_999_999);
-		if let Err(err) = get_route(&our_id,
+		if let Err(err) = get_route(&our_id, &route_params, None,
 			&route_params, &network_graph.read_only(), None, Arc::clone(&logger), &scorer,
 			&Default::default(), &random_seed_bytes) {
 				assert_eq!(err, "Failed to find a path to the given destination");
@@ -4242,7 +4313,7 @@ mod tests {
 		});
 
 		// A payment above the minimum should pass
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 2);
 	}
@@ -4335,7 +4406,7 @@ mod tests {
 		let mut route_params = RouteParameters::from_payment_params_and_value(
 			payment_params.clone(), 60_000);
 		route_params.max_total_routing_fee_msat = Some(15_000);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		// Overpay fees to hit htlc_minimum_msat.
 		let overpaid_fees = route.paths[0].hops[0].fee_msat + route.paths[1].hops[0].fee_msat;
@@ -4384,7 +4455,7 @@ mod tests {
 			excess_data: Vec::new()
 		});
 
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		// Fine to overpay for htlc_minimum_msat if it allows us to save fee.
 		assert_eq!(route.paths.len(), 1);
@@ -4393,7 +4464,7 @@ mod tests {
 		assert_eq!(fees, 5_000);
 
 		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 50_000);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		// Not fine to overpay for htlc_minimum_msat if it requires paying more than fee on
 		// the other channel.
@@ -4452,7 +4523,7 @@ mod tests {
 		let mut route_params = RouteParameters::from_payment_params_and_value(
 			payment_params.clone(), 5_000);
 		route_params.max_total_routing_fee_msat = Some(9_999);
-		if let Err(err) = get_route(&our_id,
+		if let Err(err) = get_route(&our_id, &route_params, None,
 			&route_params, &network_graph.read_only(), None, Arc::clone(&logger), &scorer,
 			&Default::default(), &random_seed_bytes) {
 				assert_eq!(err, "Failed to find route that adheres to the maximum total fee limit");
@@ -4461,7 +4532,7 @@ mod tests {
 		let mut route_params = RouteParameters::from_payment_params_and_value(
 			payment_params.clone(), 5_000);
 		route_params.max_total_routing_fee_msat = Some(10_000);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.get_total_fees(), 10_000);
 	}
@@ -4505,7 +4576,7 @@ mod tests {
 
 		// If all the channels require some features we don't understand, route should fail
 		let mut route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
-		if let Err(err) = get_route(&our_id,
+		if let Err(err) = get_route(&our_id, &route_params, None,
 			&route_params, &network_graph.read_only(), None, Arc::clone(&logger), &scorer,
 			&Default::default(), &random_seed_bytes) {
 				assert_eq!(err, "Failed to find a path to the given destination");
@@ -4515,7 +4586,7 @@ mod tests {
 		let our_chans = [get_channel_details(Some(42), nodes[7].clone(),
 			InitFeatures::from_le_bytes(vec![0b11]), 250_000_000)];
 		route_params.payment_params.max_path_length = 2;
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(),
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(),
 			Some(&our_chans.iter().collect::<Vec<_>>()), Arc::clone(&logger), &scorer,
 			&Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 2);
@@ -4553,7 +4624,7 @@ mod tests {
 
 		// If all nodes require some features we don't understand, route should fail
 		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
-		if let Err(err) = get_route(&our_id,
+		if let Err(err) = get_route(&our_id, &route_params, None,
 			&route_params, &network_graph.read_only(), None, Arc::clone(&logger), &scorer,
 			&Default::default(), &random_seed_bytes) {
 				assert_eq!(err, "Failed to find a path to the given destination");
@@ -4562,7 +4633,7 @@ mod tests {
 		// If we specify a channel to node7, that overrides our local channel view and that gets used
 		let our_chans = [get_channel_details(Some(42), nodes[7].clone(),
 			InitFeatures::from_le_bytes(vec![0b11]), 250_000_000)];
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(),
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(),
 			Some(&our_chans.iter().collect::<Vec<_>>()), Arc::clone(&logger), &scorer,
 			&Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 2);
@@ -4597,7 +4668,7 @@ mod tests {
 		// Route to 1 via 2 and 3 because our channel to 1 is disabled
 		let payment_params = PaymentParameters::from_node_id(nodes[0], 42);
 		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 3);
 
@@ -4627,7 +4698,7 @@ mod tests {
 		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
 		let our_chans = [get_channel_details(Some(42), nodes[7].clone(),
 			InitFeatures::from_le_bytes(vec![0b11]), 250_000_000)];
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(),
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(),
 			Some(&our_chans.iter().collect::<Vec<_>>()), Arc::clone(&logger), &scorer,
 			&Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 2);
@@ -4756,7 +4827,7 @@ mod tests {
 			let payment_params = PaymentParameters::from_node_id(nodes[6], 42)
 				.with_route_hints(invalid_last_hops).unwrap();
 			let route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
-			if let Err(err) = get_route(&our_id,
+			if let Err(err) = get_route(&our_id, &route_params, None,
 				&route_params, &network_graph.read_only(), None, Arc::clone(&logger), &scorer,
 				&Default::default(), &random_seed_bytes) {
 					assert_eq!(err, "Route hint cannot have the payee as the source.");
@@ -4767,7 +4838,7 @@ mod tests {
 			.with_route_hints(last_hops_multi_private_channels(&nodes)).unwrap();
 		payment_params.max_path_length = 5;
 		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 5);
 
@@ -4845,7 +4916,7 @@ mod tests {
 
 		// Test handling of an empty RouteHint passed in Invoice.
 		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 5);
 
@@ -4959,7 +5030,7 @@ mod tests {
 
 		let mut route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
 		route_params.payment_params.max_path_length = 4;
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 4);
 
@@ -4991,7 +5062,7 @@ mod tests {
 		assert_eq!(route.paths[0].hops[3].node_features.le_flags(), default_node_features().le_flags()); // We dont pass flags in from invoices yet
 		assert_eq!(route.paths[0].hops[3].channel_features.le_flags(), &Vec::<u8>::new()); // We can't learn any flags from invoices, sadly
 		route_params.payment_params.max_path_length = 3;
-		get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap_err();
 	}
 
@@ -5039,7 +5110,7 @@ mod tests {
 		});
 
 		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &[42u8; 32]).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 4);
 
@@ -5125,7 +5196,7 @@ mod tests {
 		// which would be handled in the same manner.
 
 		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 5);
 
@@ -5181,7 +5252,7 @@ mod tests {
 		let payment_params = PaymentParameters::from_node_id(nodes[6], 42)
 			.with_route_hints(last_hops.clone()).unwrap();
 		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(),
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(),
 			Some(&our_chans.iter().collect::<Vec<_>>()), Arc::clone(&logger), &scorer,
 			&Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 2);
@@ -5207,7 +5278,7 @@ mod tests {
 			.with_route_hints(last_hops).unwrap();
 		let route_params = RouteParameters::from_payment_params_and_value(
 			payment_params.clone(), 100);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 4);
 
@@ -5243,7 +5314,7 @@ mod tests {
 
 		// ...but still use 8 for larger payments as 6 has a variable feerate
 		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 2000);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths[0].hops.len(), 5);
 
@@ -5455,7 +5526,7 @@ mod tests {
 			// Now, attempt to route an exact amount we have should be fine.
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params.clone(), 250_000_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 1);
 			let path = route.paths.last().unwrap();
@@ -5499,7 +5570,7 @@ mod tests {
 			// Now, attempt to route an exact amount we have should be fine.
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params.clone(), 200_000_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(),
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(),
 				Some(&our_chans.iter().collect::<Vec<_>>()), Arc::clone(&logger), &scorer,
 				&Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 1);
@@ -5555,7 +5626,7 @@ mod tests {
 			// Now, attempt to route an exact amount we have should be fine.
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params.clone(), 15_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 1);
 			let path = route.paths.last().unwrap();
@@ -5635,7 +5706,7 @@ mod tests {
 			// Now, attempt to route an exact amount we have should be fine.
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params.clone(), 15_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 1);
 			let path = route.paths.last().unwrap();
@@ -5674,7 +5745,7 @@ mod tests {
 			// Now, attempt to route an exact amount we have should be fine.
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params.clone(), 10_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 1);
 			let path = route.paths.last().unwrap();
@@ -5800,7 +5871,7 @@ mod tests {
 			// Now, attempt to route 49 sats (just a bit below the capacity).
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params.clone(), 49_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 1);
 			let mut total_amount_paid_msat = 0;
@@ -5816,7 +5887,7 @@ mod tests {
 			// Attempt to route an exact amount is also fine
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params, 50_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 1);
 			let mut total_amount_paid_msat = 0;
@@ -5869,7 +5940,7 @@ mod tests {
 		{
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params, 50_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 1);
 			let mut total_amount_paid_msat = 0;
@@ -6070,7 +6141,7 @@ mod tests {
 			// Our algorithm should provide us with these 3 paths.
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params.clone(), 250_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 3);
 			let mut total_amount_paid_msat = 0;
@@ -6090,7 +6161,7 @@ mod tests {
 			// Attempt to route an exact amount is also fine
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params.clone(), 290_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 3);
 			let mut total_amount_paid_msat = 0;
@@ -6328,7 +6399,7 @@ mod tests {
 
 		let route_params = RouteParameters::from_payment_params_and_value(
 			payment_params, amt);
-		let res = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let res = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes);
 		res
 	}
@@ -6532,7 +6603,7 @@ mod tests {
 			// Now, attempt to route 200 sats (exact amount we can route).
 			let route_params = RouteParameters { payment_params: payment_params.clone(), final_value_msat: 200_000,
 				max_total_routing_fee_msat: Some(150_000) };
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 2);
 
@@ -6640,7 +6711,7 @@ mod tests {
 		// overpay at all.
 		let route_params = RouteParameters::from_payment_params_and_value(
 			payment_params, 100_000);
-		let mut route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let mut route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths.len(), 2);
 		route.paths.sort_by_key(|path| path.hops[0].short_channel_id);
@@ -6781,7 +6852,7 @@ mod tests {
 			// Our algorithm should provide us with these 3 paths.
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params.clone(), 125_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 3);
 			let mut total_amount_paid_msat = 0;
@@ -6797,7 +6868,7 @@ mod tests {
 			// Attempt to route without the last small cheap channel
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params, 90_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 2);
 			let mut total_amount_paid_msat = 0;
@@ -7033,7 +7104,7 @@ mod tests {
 			let mut route_params = RouteParameters::from_payment_params_and_value(
 				payment_params, 90_000);
 			route_params.max_total_routing_fee_msat = Some(90_000*2);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 1);
 			assert_eq!(route.paths[0].hops.len(), 2);
@@ -7107,7 +7178,7 @@ mod tests {
 			let mut route_params = RouteParameters::from_payment_params_and_value(
 				payment_params, 90_000);
 			route_params.max_total_routing_fee_msat = Some(90_000*2);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 				Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 			assert_eq!(route.paths.len(), 1);
 			assert_eq!(route.paths[0].hops.len(), 2);
@@ -7151,7 +7222,7 @@ mod tests {
 		{
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params.clone(), 100_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), Some(&[
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), Some(&[
 				&get_channel_details(Some(3), nodes[0], channelmanager::provided_init_features(&config), 200_000),
 				&get_channel_details(Some(2), nodes[0], channelmanager::provided_init_features(&config), 10_000),
 			]), Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
@@ -7165,7 +7236,7 @@ mod tests {
 		{
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params.clone(), 100_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), Some(&[
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), Some(&[
 				&get_channel_details(Some(3), nodes[0], channelmanager::provided_init_features(&config), 50_000),
 				&get_channel_details(Some(2), nodes[0], channelmanager::provided_init_features(&config), 50_000),
 			]), Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
@@ -7193,7 +7264,7 @@ mod tests {
 			// this node.
 			let route_params = RouteParameters::from_payment_params_and_value(
 				payment_params, 100_000);
-			let route = get_route(&our_id, &route_params, &network_graph.read_only(), Some(&[
+			let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), Some(&[
 				&get_channel_details(Some(2), nodes[0], channelmanager::provided_init_features(&config), 50_000),
 				&get_channel_details(Some(3), nodes[0], channelmanager::provided_init_features(&config), 50_000),
 				&get_channel_details(Some(5), nodes[0], channelmanager::provided_init_features(&config), 50_000),
@@ -7512,7 +7583,7 @@ mod tests {
 		let random_seed_bytes = [42; 32];
 		let route_params = RouteParameters::from_payment_params_and_value(
 			payment_params.clone(), 100);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths.len(), 1);
 
@@ -7672,7 +7743,7 @@ mod tests {
 		// those when it is not applied.
 		let route_params = RouteParameters::from_payment_params_and_value(
 			payment_params, 75_000_000);
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &ProbabilisticScoringFeeParameters::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths.len(), 2);
 		assert!((route.paths[0].hops[1].short_channel_id == 4 && route.paths[1].hops[1].short_channel_id == 13) ||
@@ -7829,7 +7900,7 @@ mod tests {
 		let mut route_params = RouteParameters::from_payment_params_and_value(
 			payment_params, max_htlc_msat + 1);
 		route_params.max_total_routing_fee_msat = None;
-		if let Err(err) = get_route(&our_id,
+		if let Err(err) = get_route(&our_id, &route_params, None,
 			&route_params, &netgraph, None, Arc::clone(&logger), &scorer, &Default::default(),
 			&random_seed_bytes)
 		{
@@ -9098,7 +9169,7 @@ mod tests {
 			.with_bolt11_features(channelmanager::provided_bolt11_invoice_features(&config))
 			.unwrap();
 		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 1_000_000);
-		get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap_err();
 
 		// Now set channel 1 max HTLC to 1M + 1 sats
@@ -9117,7 +9188,7 @@ mod tests {
 		});
 
 		// And attempt the same payment again, but this time it should work.
-		let route = get_route(&our_id, &route_params, &network_graph.read_only(), None,
+		let route = get_route(&our_id, &route_params, None, &network_graph.read_only(), None,
 			Arc::clone(&logger), &scorer, &Default::default(), &random_seed_bytes).unwrap();
 		assert_eq!(route.paths.len(), 1);
 		assert_eq!(route.paths[0].hops.len(), 3);
@@ -9546,7 +9617,7 @@ pub(crate) mod bench_utils {
 				let route_params = RouteParameters::from_payment_params_and_value(
 					params.clone(), amt_msat);
 				let path_exists =
-					get_route(&payer, &route_params, &graph.read_only(), Some(&[&first_hop]),
+					get_route(&payer, &route_params, None, &graph.read_only(), Some(&[&first_hop]),
 						&TestLogger::new(), scorer, score_params, &random_seed_bytes).is_ok();
 				if path_exists {
 					route_endpoints.push((first_hop, params, amt_msat));
@@ -9686,7 +9757,7 @@ pub mod benches {
 		bench.bench_function(bench_name, |b| b.iter(|| {
 			let (first_hop, params, amt) = &route_endpoints[idx % route_endpoints.len()];
 			let route_params = RouteParameters::from_payment_params_and_value(params.clone(), *amt);
-			assert!(get_route(&payer, &route_params, &graph.read_only(), Some(&[first_hop]),
+			assert!(get_route(&payer, &route_params, None, &graph.read_only(), Some(&[first_hop]),
 				&DummyLogger{}, &scorer, score_params, &random_seed_bytes).is_ok());
 			idx += 1;
 		}));

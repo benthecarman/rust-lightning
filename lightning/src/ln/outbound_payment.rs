@@ -891,6 +891,25 @@ where
 			best_block_height, pending_events, &send_payment_along_path)
 	}
 
+	pub(super) fn send_payment_with_partial_amount<R: Deref, ES: Deref, NS: Deref, IH, SP>(
+		&self, payment_hash: PaymentHash, recipient_onion: RecipientOnionFields, payment_id: PaymentId,
+		retry_strategy: Retry, route_params: RouteParameters, partial_amount_msat: Option<u64>, router: &R,
+		first_hops: Vec<ChannelDetails>, compute_inflight_htlcs: IH, entropy_source: &ES,
+		node_signer: &NS, best_block_height: u32,
+		pending_events: &Mutex<VecDeque<(events::Event, Option<EventCompletionAction>)>>, send_payment_along_path: SP,
+	) -> Result<(), RetryableSendFailure>
+	where
+		R::Target: Router,
+		ES::Target: EntropySource,
+		NS::Target: NodeSigner,
+		IH: Fn() -> InFlightHtlcs,
+		SP: Fn(SendAlongPathArgs) -> Result<(), APIError>,
+	{
+		self.send_payment_for_non_bolt12_invoice_with_partial_amount(payment_id, payment_hash, recipient_onion, None, retry_strategy,
+			route_params, partial_amount_msat, router, first_hops, &compute_inflight_htlcs, entropy_source, node_signer,
+			best_block_height, pending_events, &send_payment_along_path)
+	}
+
 	#[rustfmt::skip]
 	pub(super) fn send_spontaneous_payment<R: Deref, ES: Deref, NS: Deref, IH, SP>(
 		&self, payment_preimage: Option<PaymentPreimage>, recipient_onion: RecipientOnionFields,
@@ -1426,6 +1445,22 @@ where
 		L::Target: Logger,
 		IH: Fn() -> InFlightHtlcs,
 	{
+		self.find_initial_route_with_partial_amount(payment_id, payment_hash, recipient_onion, keysend_preimage,
+			invoice_request, route_params, None, router, first_hops, inflight_htlcs, node_signer, best_block_height)
+	}
+
+	fn find_initial_route_with_partial_amount<R: Deref, NS: Deref, IH>(
+		&self, payment_id: PaymentId, payment_hash: PaymentHash, recipient_onion: &RecipientOnionFields,
+		keysend_preimage: Option<PaymentPreimage>, invoice_request: Option<&InvoiceRequest>,
+		route_params: &mut RouteParameters, partial_amount_msat: Option<u64>, router: &R, first_hops: &Vec<ChannelDetails>,
+		inflight_htlcs: &IH, node_signer: &NS, best_block_height: u32,
+	) -> Result<Route, RetryableSendFailure>
+	where
+		R::Target: Router,
+		NS::Target: NodeSigner,
+		L::Target: Logger,
+		IH: Fn() -> InFlightHtlcs,
+	{
 		#[cfg(feature = "std")] {
 			if has_expired(&route_params) {
 				log_error!(self.logger, "Payment with id {} and hash {} had expired before we started paying",
@@ -1443,8 +1478,8 @@ where
 				RetryableSendFailure::OnionPacketSizeExceeded
 			})?;
 
-		let mut route = router.find_route_with_id(
-			&node_signer.get_node_id(Recipient::Node).unwrap(), route_params,
+		let mut route = router.find_route_with_partial_amount_and_id(
+			&node_signer.get_node_id(Recipient::Node).unwrap(), route_params, partial_amount_msat,
 			Some(&first_hops.iter().collect::<Vec<_>>()), inflight_htlcs(),
 			payment_hash, payment_id,
 		).map_err(|_| {
@@ -1484,8 +1519,29 @@ where
 		IH: Fn() -> InFlightHtlcs,
 		SP: Fn(SendAlongPathArgs) -> Result<(), APIError>,
 	{
-		let route = self.find_initial_route(
-			payment_id, payment_hash, &recipient_onion, keysend_preimage, None, &mut route_params, router,
+		self.send_payment_for_non_bolt12_invoice_with_partial_amount(payment_id, payment_hash, recipient_onion,
+			keysend_preimage, retry_strategy, route_params, None, router, first_hops, inflight_htlcs, entropy_source,
+			node_signer, best_block_height, pending_events, send_payment_along_path)
+	}
+
+	#[rustfmt::skip]
+	fn send_payment_for_non_bolt12_invoice_with_partial_amount<R: Deref, NS: Deref, ES: Deref, IH, SP>(
+		&self, payment_id: PaymentId, payment_hash: PaymentHash, recipient_onion: RecipientOnionFields,
+		keysend_preimage: Option<PaymentPreimage>, retry_strategy: Retry, mut route_params: RouteParameters,
+		partial_amount_msat: Option<u64>, router: &R, first_hops: Vec<ChannelDetails>, inflight_htlcs: IH, entropy_source: &ES,
+		node_signer: &NS, best_block_height: u32,
+		pending_events: &Mutex<VecDeque<(events::Event, Option<EventCompletionAction>)>>, send_payment_along_path: SP,
+	) -> Result<(), RetryableSendFailure>
+	where
+		R::Target: Router,
+		ES::Target: EntropySource,
+		NS::Target: NodeSigner,
+		L::Target: Logger,
+		IH: Fn() -> InFlightHtlcs,
+		SP: Fn(SendAlongPathArgs) -> Result<(), APIError>,
+	{
+		let route = self.find_initial_route_with_partial_amount(
+			payment_id, payment_hash, &recipient_onion, keysend_preimage, None, &mut route_params, partial_amount_msat, router,
 			&first_hops, &inflight_htlcs, node_signer, best_block_height,
 		)?;
 

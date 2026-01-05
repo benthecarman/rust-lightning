@@ -2791,6 +2791,7 @@ pub fn get_route(send_node: &Node, route_params: &RouteParameters) -> Result<Rou
 	router::get_route(
 		&send_node.node.get_our_node_id(),
 		route_params,
+		None,
 		&send_node.network_graph.read_only(),
 		Some(&first_hops.iter().collect::<Vec<_>>()),
 		send_node.logger,

@@ -5614,6 +5614,41 @@ where
 		)
 	}
 
+	/// Similar to [`ChannelManager::send_payment`], but allows for a partial payment amount.
+	///
+	/// If `partial_amount_msat` is provided, it will be used as the payment amount instead of
+	/// [`RouteParameters::final_value_msat`]. This allows for partial invoice payments where
+	/// the amount sent may be less than the invoice amount.
+	///
+	/// # Note
+	///
+	/// When making a partial payment, the `partial_amount_msat` should be less than or equal to
+	/// the total invoice amount specified in [`RouteParameters::final_value_msat`].
+	pub fn send_payment_with_partial_amount(
+		&self, payment_hash: PaymentHash, recipient_onion: RecipientOnionFields,
+		payment_id: PaymentId, route_params: RouteParameters, retry_strategy: Retry,
+		partial_amount_msat: Option<u64>,
+	) -> Result<(), RetryableSendFailure> {
+		let best_block_height = self.best_block.read().unwrap().height;
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		self.pending_outbound_payments.send_payment_with_partial_amount(
+			payment_hash,
+			recipient_onion,
+			payment_id,
+			retry_strategy,
+			route_params,
+			partial_amount_msat,
+			&self.router,
+			self.list_usable_channels(),
+			|| self.compute_inflight_htlcs(),
+			&self.entropy_source,
+			&self.node_signer,
+			best_block_height,
+			&self.pending_events,
+			|args| self.send_payment_along_path(args),
+		)
+	}
+
 	#[cfg(any(test, feature = "_externalize_tests"))]
 	pub(super) fn test_send_payment_internal(
 		&self, route: &Route, payment_hash: PaymentHash, recipient_onion: RecipientOnionFields,
