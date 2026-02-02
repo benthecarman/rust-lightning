@@ -1,6 +1,7 @@
-//! Common utilities shared between [`FilesystemStore`].
+//! Common utilities shared between [`FilesystemStore`] and [`FilesystemStoreV2`].
 //!
 //! [`FilesystemStore`]: crate::fs_store::FilesystemStore
+//! [`FilesystemStoreV2`]: crate::fs_store_v2::FilesystemStoreV2
 
 use crate::utils::{check_namespace_key_validity, is_valid_kvstore_str};
 
