@@ -12,6 +12,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::UNIX_EPOCH;
 
 #[cfg(target_os = "windows")]
 use std::ffi::OsStr;
@@ -34,6 +35,7 @@ macro_rules! call {
 
 #[cfg(target_os = "windows")]
 use call;
+use lightning::util::persist::{PageToken, PaginatedListResponse};
 
 /// Converts a path to a null-terminated wide string for Windows API calls.
 #[cfg(target_os = "windows")]
@@ -44,6 +46,11 @@ fn path_to_windows_str<T: AsRef<OsStr>>(path: &T) -> Vec<u16> {
 // The number of times we retry listing keys in `FilesystemStore::list` before we give up reaching
 // a consistent view and error out.
 const LIST_DIR_CONSISTENCY_RETRIES: usize = 10;
+
+// The directory name used for empty namespaces in v2.
+// Uses brackets which are not in KVSTORE_NAMESPACE_KEY_ALPHABET, preventing collisions
+// with valid namespace names.
+pub(crate) const EMPTY_NAMESPACE_DIR: &str = "[empty]";
 
 /// Inner state shared between sync and async operations for filesystem stores.
 ///
@@ -112,7 +119,7 @@ impl FilesystemStoreInner {
 	}
 
 	fn get_dest_dir_path(
-		&self, primary_namespace: &str, secondary_namespace: &str,
+		&self, primary_namespace: &str, secondary_namespace: &str, use_empty_ns_dir: bool,
 	) -> std::io::Result<PathBuf> {
 		let mut dest_dir_path = {
 			#[cfg(target_os = "windows")]
@@ -127,9 +134,22 @@ impl FilesystemStoreInner {
 			}
 		};
 
-		dest_dir_path.push(primary_namespace);
-		if !secondary_namespace.is_empty() {
-			dest_dir_path.push(secondary_namespace);
+		if use_empty_ns_dir {
+			dest_dir_path.push(if primary_namespace.is_empty() {
+				EMPTY_NAMESPACE_DIR
+			} else {
+				primary_namespace
+			});
+			dest_dir_path.push(if secondary_namespace.is_empty() {
+				EMPTY_NAMESPACE_DIR
+			} else {
+				secondary_namespace
+			});
+		} else {
+			dest_dir_path.push(primary_namespace);
+			if !secondary_namespace.is_empty() {
+				dest_dir_path.push(secondary_namespace);
+			}
 		}
 
 		Ok(dest_dir_path)
@@ -137,11 +157,12 @@ impl FilesystemStoreInner {
 
 	fn get_checked_dest_file_path(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: Option<&str>,
-		operation: &str,
+		operation: &str, use_empty_ns_dir: bool,
 	) -> lightning::io::Result<PathBuf> {
 		check_namespace_key_validity(primary_namespace, secondary_namespace, key, operation)?;
 
-		let mut dest_file_path = self.get_dest_dir_path(primary_namespace, secondary_namespace)?;
+		let mut dest_file_path =
+			self.get_dest_dir_path(primary_namespace, secondary_namespace, use_empty_ns_dir)?;
 		if let Some(key) = key {
 			dest_file_path.push(key);
 		}
@@ -217,8 +238,13 @@ impl FilesystemStoreInner {
 	/// returns early without writing.
 	fn write_version(
 		&self, inner_lock_ref: Arc<RwLock<u64>>, dest_file_path: PathBuf, buf: Vec<u8>,
-		version: u64,
+		version: u64, preserve_mtime: bool,
 	) -> lightning::io::Result<()> {
+		let mtime = if preserve_mtime {
+			fs::metadata(&dest_file_path).ok().and_then(|m| m.modified().ok())
+		} else {
+			None
+		};
 		let parent_directory = dest_file_path.parent().ok_or_else(|| {
 			let msg =
 				format!("Could not retrieve parent directory of {}.", dest_file_path.display());
@@ -238,6 +264,13 @@ impl FilesystemStoreInner {
 		{
 			let mut tmp_file = fs::File::create(&tmp_file_path)?;
 			tmp_file.write_all(&buf)?;
+
+			// If we need to preserve the original mtime (for updates), set it before fsync.
+			if let Some(mtime) = mtime {
+				let times = fs::FileTimes::new().set_modified(mtime);
+				tmp_file.set_times(times)?;
+			}
+
 			tmp_file.sync_all()?;
 		}
 
@@ -370,13 +403,76 @@ impl FilesystemStoreInner {
 		})
 	}
 
-	fn list(&self, prefixed_dest: PathBuf) -> lightning::io::Result<Vec<String>> {
+	fn list_paginated(
+		&self, prefixed_dest: PathBuf, page_token: Option<PageToken>,
+	) -> lightning::io::Result<PaginatedListResponse> {
+		if !prefixed_dest.exists() {
+			return Ok(PaginatedListResponse { keys: Vec::new(), next_page_token: None });
+		}
+
+		// Collect all entries with their modification times
+		let mut entries: Vec<(u64, String)> = Vec::new();
+		for dir_entry in fs::read_dir(&prefixed_dest)? {
+			let dir_entry = dir_entry?;
+
+			let key = get_key_from_dir_entry_path(&dir_entry.path(), prefixed_dest.as_path())?;
+			// Get modification time as millis since epoch
+			let mtime_millis = dir_entry
+				.metadata()
+				.ok()
+				.and_then(|m| m.modified().ok())
+				.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+				.map(|d| d.as_millis() as u64)
+				.unwrap_or(0);
+
+			entries.push((mtime_millis, key));
+		}
+
+		// Sort by mtime descending (newest first), then by key descending for same mtime
+		entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+		// Find starting position based on page token
+		let start_idx = if let Some(token) = page_token {
+			let (token_mtime, token_key) = parse_page_token(&token.0)?;
+
+			// Find entries that come after the token (older entries = lower mtime)
+			// or same mtime but lexicographically smaller key (since we sort descending)
+			entries
+				.iter()
+				.position(|(mtime, key)| {
+					*mtime < token_mtime
+						|| (*mtime == token_mtime && key.as_str() < token_key.as_str())
+				})
+				.unwrap_or(entries.len())
+		} else {
+			0
+		};
+
+		// Take PAGE_SIZE entries starting from start_idx
+		let page_entries: Vec<_> =
+			entries.iter().skip(start_idx).take(PAGE_SIZE).cloned().collect();
+
+		let keys: Vec<String> = page_entries.iter().map(|(_, key)| key.clone()).collect();
+
+		// Determine next page token
+		let next_page_token = if start_idx + PAGE_SIZE < entries.len() {
+			page_entries.last().map(|(mtime, key)| PageToken(format_page_token(*mtime, key)))
+		} else {
+			None
+		};
+
+		Ok(PaginatedListResponse { keys, next_page_token })
+	}
+
+	fn list(
+		&self, prefixed_dest: PathBuf, retry_on_race: bool,
+	) -> lightning::io::Result<Vec<String>> {
 		if !Path::new(&prefixed_dest).exists() {
 			return Ok(Vec::new());
 		}
 
 		let mut keys;
-		let mut retries = LIST_DIR_CONSISTENCY_RETRIES;
+		let mut retries = if retry_on_race { LIST_DIR_CONSISTENCY_RETRIES } else { 0 };
 
 		'retry_list: loop {
 			keys = Vec::new();
@@ -418,57 +514,65 @@ impl FilesystemStoreInner {
 impl FilesystemStoreState {
 	pub(crate) fn read_impl(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+		use_empty_ns_dir: bool,
 	) -> Result<Vec<u8>, lightning::io::Error> {
 		let path = self.inner.get_checked_dest_file_path(
 			primary_namespace,
 			secondary_namespace,
 			Some(key),
 			"read",
+			use_empty_ns_dir,
 		)?;
 		self.inner.read(path)
 	}
 
 	pub(crate) fn write_impl(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
+		use_empty_ns_dir: bool,
 	) -> Result<(), lightning::io::Error> {
 		let path = self.inner.get_checked_dest_file_path(
 			primary_namespace,
 			secondary_namespace,
 			Some(key),
 			"write",
+			use_empty_ns_dir,
 		)?;
 		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(path.clone());
-		self.inner.write_version(inner_lock_ref, path, buf, version)
+		self.inner.write_version(inner_lock_ref, path, buf, version, use_empty_ns_dir)
 	}
 
 	pub(crate) fn remove_impl(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
+		use_empty_ns_dir: bool,
 	) -> Result<(), lightning::io::Error> {
 		let path = self.inner.get_checked_dest_file_path(
 			primary_namespace,
 			secondary_namespace,
 			Some(key),
 			"remove",
+			use_empty_ns_dir,
 		)?;
 		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(path.clone());
 		self.inner.remove_version(inner_lock_ref, path, lazy, version)
 	}
 
 	pub(crate) fn list_impl(
-		&self, primary_namespace: &str, secondary_namespace: &str,
+		&self, primary_namespace: &str, secondary_namespace: &str, use_empty_ns_dir: bool,
 	) -> Result<Vec<String>, lightning::io::Error> {
 		let path = self.inner.get_checked_dest_file_path(
 			primary_namespace,
 			secondary_namespace,
 			None,
 			"list",
+			use_empty_ns_dir,
 		)?;
-		self.inner.list(path)
+		self.inner.list(path, !use_empty_ns_dir)
 	}
 
 	#[cfg(feature = "tokio")]
 	pub(crate) fn read_async(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+		use_empty_ns_dir: bool,
 	) -> impl Future<Output = Result<Vec<u8>, lightning::io::Error>> + 'static + Send {
 		let this = Arc::clone(&self.inner);
 		let path = this.get_checked_dest_file_path(
@@ -476,6 +580,7 @@ impl FilesystemStoreState {
 			secondary_namespace,
 			Some(key),
 			"read",
+			use_empty_ns_dir,
 		);
 
 		async move {
@@ -492,10 +597,17 @@ impl FilesystemStoreState {
 	#[cfg(feature = "tokio")]
 	pub(crate) fn write_async(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
+		use_empty_ns_dir: bool,
 	) -> impl Future<Output = Result<(), lightning::io::Error>> + 'static + Send {
 		let this = Arc::clone(&self.inner);
 		let path = this
-			.get_checked_dest_file_path(primary_namespace, secondary_namespace, Some(key), "write")
+			.get_checked_dest_file_path(
+				primary_namespace,
+				secondary_namespace,
+				Some(key),
+				"write",
+				use_empty_ns_dir,
+			)
 			.map(|path| (self.get_new_version_and_lock_ref(path.clone()), path));
 
 		async move {
@@ -504,7 +616,7 @@ impl FilesystemStoreState {
 				Err(e) => return Err(e),
 			};
 			tokio::task::spawn_blocking(move || {
-				this.write_version(inner_lock_ref, path, buf, version)
+				this.write_version(inner_lock_ref, path, buf, version, use_empty_ns_dir)
 			})
 			.await
 			.unwrap_or_else(|e| Err(lightning::io::Error::new(lightning::io::ErrorKind::Other, e)))
@@ -514,10 +626,17 @@ impl FilesystemStoreState {
 	#[cfg(feature = "tokio")]
 	pub(crate) fn remove_async(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
+		use_empty_ns_dir: bool,
 	) -> impl Future<Output = Result<(), lightning::io::Error>> + 'static + Send {
 		let this = Arc::clone(&self.inner);
 		let path = this
-			.get_checked_dest_file_path(primary_namespace, secondary_namespace, Some(key), "remove")
+			.get_checked_dest_file_path(
+				primary_namespace,
+				secondary_namespace,
+				Some(key),
+				"remove",
+				use_empty_ns_dir,
+			)
 			.map(|path| (self.get_new_version_and_lock_ref(path.clone()), path));
 
 		async move {
@@ -535,31 +654,49 @@ impl FilesystemStoreState {
 
 	#[cfg(feature = "tokio")]
 	pub(crate) fn list_async(
-		&self, primary_namespace: &str, secondary_namespace: &str,
+		&self, primary_namespace: &str, secondary_namespace: &str, use_empty_ns_dir: bool,
 	) -> impl Future<Output = Result<Vec<String>, lightning::io::Error>> + 'static + Send {
 		let this = Arc::clone(&self.inner);
 
-		let path =
-			this.get_checked_dest_file_path(primary_namespace, secondary_namespace, None, "list");
+		let path = this.get_checked_dest_file_path(
+			primary_namespace,
+			secondary_namespace,
+			None,
+			"list",
+			use_empty_ns_dir,
+		);
 
 		async move {
 			let path = match path {
 				Ok(path) => path,
 				Err(e) => return Err(e),
 			};
-			tokio::task::spawn_blocking(move || this.list(path)).await.unwrap_or_else(|e| {
-				Err(lightning::io::Error::new(lightning::io::ErrorKind::Other, e))
-			})
+			tokio::task::spawn_blocking(move || this.list(path, !use_empty_ns_dir))
+				.await
+				.unwrap_or_else(|e| {
+					Err(lightning::io::Error::new(lightning::io::ErrorKind::Other, e))
+				})
 		}
 	}
 
 	pub(crate) fn list_all_keys_impl(
-		&self,
+		&self, use_empty_ns_dir: bool,
 	) -> Result<Vec<(String, String, String)>, lightning::io::Error> {
 		let prefixed_dest = &self.inner.data_dir;
 		if !prefixed_dest.exists() {
 			return Ok(Vec::new());
 		}
+
+		// When use_empty_ns_dir is true (v2), namespace directories may be named
+		// [empty] to represent empty namespaces, so we resolve via namespace_from_dir_path.
+		// When false (v1), directory names are always valid kvstore strings.
+		let resolve_ns = |path: &Path, base: &Path| -> Result<String, lightning::io::Error> {
+			if use_empty_ns_dir {
+				namespace_from_dir_path(path)
+			} else {
+				get_key_from_dir_entry_path(path, base)
+			}
+		};
 
 		let mut keys = Vec::new();
 
@@ -581,8 +718,7 @@ impl FilesystemStoreState {
 				let secondary_path = secondary_entry.path();
 
 				if dir_entry_is_key(&secondary_entry)? {
-					let primary_namespace =
-						get_key_from_dir_entry_path(&primary_path, prefixed_dest)?;
+					let primary_namespace = resolve_ns(&primary_path, prefixed_dest)?;
 					let secondary_namespace = String::new();
 					let key = get_key_from_dir_entry_path(&secondary_path, &primary_path)?;
 					keys.push((primary_namespace, secondary_namespace, key));
@@ -595,10 +731,8 @@ impl FilesystemStoreState {
 					let tertiary_path = tertiary_entry.path();
 
 					if dir_entry_is_key(&tertiary_entry)? {
-						let primary_namespace =
-							get_key_from_dir_entry_path(&primary_path, prefixed_dest)?;
-						let secondary_namespace =
-							get_key_from_dir_entry_path(&secondary_path, &primary_path)?;
+						let primary_namespace = resolve_ns(&primary_path, prefixed_dest)?;
+						let secondary_namespace = resolve_ns(&secondary_path, &primary_path)?;
 						let key = get_key_from_dir_entry_path(&tertiary_path, &secondary_path)?;
 						keys.push((primary_namespace, secondary_namespace, key));
 					} else {
@@ -620,6 +754,109 @@ impl FilesystemStoreState {
 			}
 		}
 		Ok(keys)
+	}
+
+	/// Sync entry point for paginated listing.
+	///
+	/// Collects all entries with their modification times, sorts by mtime descending
+	/// (newest first), and returns a page of results with an optional next page token.
+	pub(crate) fn list_paginated_impl(
+		&self, primary_namespace: &str, secondary_namespace: &str, page_token: Option<PageToken>,
+	) -> lightning::io::Result<PaginatedListResponse> {
+		let path = self.inner.get_checked_dest_file_path(
+			primary_namespace,
+			secondary_namespace,
+			None,
+			"list_paginated",
+			true,
+		)?;
+		self.inner.list_paginated(path, page_token)
+	}
+
+	#[cfg(feature = "tokio")]
+	pub(crate) fn list_paginated_async(
+		&self, primary_namespace: &str, secondary_namespace: &str, page_token: Option<PageToken>,
+	) -> impl Future<Output = Result<PaginatedListResponse, lightning::io::Error>> + 'static + Send
+	{
+		let this = Arc::clone(&self.inner);
+
+		let path = this.get_checked_dest_file_path(
+			primary_namespace,
+			secondary_namespace,
+			None,
+			"list_paginated",
+			true,
+		);
+
+		async move {
+			let path = match path {
+				Ok(path) => path,
+				Err(e) => return Err(e),
+			};
+			tokio::task::spawn_blocking(move || this.list_paginated(path, page_token))
+				.await
+				.unwrap_or_else(|e| {
+					Err(lightning::io::Error::new(lightning::io::ErrorKind::Other, e))
+				})
+		}
+	}
+}
+
+/// The fixed page size for paginated listing operations.
+pub(crate) const PAGE_SIZE: usize = 50;
+
+/// The length of the timestamp in a page token (milliseconds since epoch as 16-digit decimal).
+const PAGE_TOKEN_TIMESTAMP_LEN: usize = 16;
+
+/// Formats a page token from mtime (millis since epoch) and key.
+pub(crate) fn format_page_token(mtime_millis: u64, key: &str) -> String {
+	format!("{:016}:{}", mtime_millis, key)
+}
+
+/// Parses a page token into mtime (millis since epoch) and key.
+pub(crate) fn parse_page_token(token: &str) -> lightning::io::Result<(u64, String)> {
+	let colon_pos = token.find(':').ok_or_else(|| {
+		lightning::io::Error::new(
+			lightning::io::ErrorKind::InvalidInput,
+			"Invalid page token format",
+		)
+	})?;
+
+	if colon_pos != PAGE_TOKEN_TIMESTAMP_LEN {
+		return Err(lightning::io::Error::new(
+			lightning::io::ErrorKind::InvalidInput,
+			"Invalid page token format",
+		));
+	}
+
+	let mtime = token[..colon_pos].parse::<u64>().map_err(|_| {
+		lightning::io::Error::new(
+			lightning::io::ErrorKind::InvalidInput,
+			"Invalid page token timestamp",
+		)
+	})?;
+
+	let key = token[colon_pos + 1..].to_string();
+
+	Ok((mtime, key))
+}
+
+/// Extracts a namespace string from a directory path, converting [`EMPTY_NAMESPACE_DIR`] to an
+/// empty string.
+fn namespace_from_dir_path(path: &Path) -> Result<String, lightning::io::Error> {
+	let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+		lightning::io::Error::new(
+			lightning::io::ErrorKind::Other,
+			format!(
+				"Failed to extract namespace from path {}",
+				PrintableString(path.to_str().unwrap_or_default())
+			),
+		)
+	})?;
+	if name == EMPTY_NAMESPACE_DIR {
+		Ok(String::new())
+	} else {
+		Ok(name.to_string())
 	}
 }
 
